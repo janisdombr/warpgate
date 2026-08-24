@@ -1,0 +1,180 @@
+# Turns each guard off in turn and requires the test named after it to notice.
+#
+# This exists because "the guards discriminate" was, until now, a statement about
+# the last afternoon somebody ran the matrix by hand and reported a number. Two
+# of the numbers reported that way were wrong. A green check is the durable form
+# of that claim; a committed snapshot is not.
+#
+# Two modes, and the difference between them is honest rather than a compromise:
+#
+#   pull_request  — only the guards whose anchor file the change touched. It
+#                   cannot see a guard broken in a file the change did not touch,
+#                   and it says so in its own output rather than leaving a green
+#                   check to imply otherwise.
+#   schedule      — all of them, split across eight parallel jobs. A sweep is
+#                   over fourteen hours on one machine and a GitHub-hosted job
+#                   is killed at six, so an unsharded "every guard" job could
+#                   only ever be started, never finished. Eight shards bring the
+#                   longest one to roughly two hours.
+#
+# A shard's green check covers the guards in that shard and no others. Only the
+# summary job, which requires every shard, stands for the sweep.
+name: Mutation matrix
+
+on:
+  pull_request:
+  schedule:
+    # Off the hour: every repository that asks for "nightly" gets 0 3 * * *.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guards:
+    name: Guards discriminate
+    runs-on: ubuntu-latest
+    # Long enough for the slowest shard, short enough that a hung run is killed
+    # rather than occupying a runner until the six-hour ceiling.
+    timeout-minutes: 300
+    strategy:
+      # One shard's failure is a real result about that shard. Cancelling the
+      # others would throw away the verdicts already earned and leave a sweep
+      # that cannot say which guards it checked.
+      fail-fast: false
+      matrix:
+        shard: ${{ github.event_name == 'pull_request' && fromJSON('["changed"]') || fromJSON('["1/8","2/8","3/8","4/8","5/8","6/8","7/8","8/8"]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+          # The whole history, because `--changed` diffs against the base and a
+          # shallow checkout has nothing to diff against. The script says so by
+          # name when this is wrong, rather than reporting zero changed guards.
+          fetch-depth: 0
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: false
+          large-packages: false
+          docker-images: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: "mutation-matrix"
+
+      - name: Install build deps
+        run: |
+          sudo apt-get install openssh-client expect
+          cargo install --locked just@1.4.0
+
+      # The gateway binary embeds these, and the matrix rebuilds the binary for
+      # every mutation.
+      - name: Build UI
+        run: |
+          just npm ci
+          just openapi
+          just npm run openapi:tests-sdk
+          just npm run build
+
+      # Twenty-four of the guards are pinned by integration tests that need a
+      # real sshd. The rest are unit tests, but the split is per guard, so the
+      # environment has to be here whichever ones get selected.
+      - name: Build test images
+        working-directory: tests
+        run: make all
+
+      - name: Install test deps
+        working-directory: tests
+        run: |
+          pip3 install poetry==1.8.3
+          poetry install
+
+      - name: Guards touched by this change
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          PYTHONPATH=$PWD poetry -C tests run \
+            python -m tests.mutation_matrix --named --changed "$BASE"
+
+      - name: This shard's guards
+        if: github.event_name != 'pull_request'
+        run: |
+          PYTHONPATH=$PWD poetry -C tests run \
+            python -m tests.mutation_matrix --named --shard "${{ matrix.shard }}"
+
+      # The run writes its verdicts to a file so a claim about coverage can be
+      # checked without repeating the run — amendment A2, which exists because
+      # every coverage number this project published was checkable only by
+      # rerunning, and two of them were wrong.
+      - name: Keep the artifact
+        if: always()
+        uses: actions/upload-artifact@2848b2cda0e5190984587ec6bb1f36730ca78d50
+        with:
+          # Per shard, because a single name would have the shards overwrite
+          # each other and leave one arbitrary subset standing for the sweep —
+          # which is exactly how the last full sweep's artifact was lost.
+          name: mutation-matrix-${{ strategy.job-index }}
+          path: tests/mutation-matrix.json
+          if-no-files-found: warn
+
+  sweep:
+    name: Every guard discriminates
+    needs: guards
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: mutation-matrix-*
+          merge-multiple: false
+          path: shards
+
+      # The check that makes the summary mean something. Each shard reports the
+      # guards it measured; a sweep is claimed only when the shards together
+      # account for every guard in the table, each of them discriminating. A
+      # shard that died without writing an artifact makes the total fall short
+      # and fails here, rather than passing quietly as a smaller sweep.
+      - name: The shards add up to a sweep
+        run: |
+          python3 - <<'EOF'
+          import json, pathlib, sys
+
+          seen, discriminating, defined = {}, 0, None
+          for f in sorted(pathlib.Path("shards").glob("*/mutation-matrix.json")):
+              a = json.loads(f.read_text())
+              if a.get("refused"):
+                  sys.exit(f"{f}: the run refused to produce a verdict:\n{a['refused']}")
+              defined = defined or a["guards_defined"]
+              if a["guards_defined"] != defined:
+                  sys.exit("the shards ran against different guard tables")
+              for r in a["results"]:
+                  seen[r["guard"]] = r["status"]
+
+          for guard, status in sorted(seen.items()):
+              if status == "discriminates":
+                  discriminating += 1
+              else:
+                  print(f"NOT DISCRIMINATING  {guard}: {status}")
+
+          if defined is None:
+              sys.exit("no shard produced an artifact; this run measured nothing")
+          print(f"{discriminating}/{len(seen)} measured guards discriminate; "
+                f"{defined} defined")
+          if len(seen) != defined:
+              sys.exit(f"only {len(seen)} of {defined} guards were measured — "
+                       "this is not a sweep")
+          if discriminating != defined:
+              sys.exit("a guard can be turned off without its own test noticing")
+          EOF
