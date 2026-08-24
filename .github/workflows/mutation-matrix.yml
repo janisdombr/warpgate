@@ -22,6 +22,12 @@
 name: Mutation matrix
 
 on:
+  # A `workflow_dispatch` is only offered for workflows that exist on the
+  # repository's default branch, and this one deliberately does not: it lives on
+  # a branch of its own so it stays out of PR #2397. Firing on a push to that
+  # branch is what is left, and it is enough — a sweep is something you ask for.
+  push:
+    branches: [tooling/mutation-matrix]
   pull_request:
   schedule:
     # Off the hour: every repository that asks for "nightly" gets 0 3 * * *.
