@@ -792,6 +792,26 @@ def run(command, **kwargs):
     return subprocess.run(command, cwd=REPO, capture_output=True, text=True, **kwargs)
 
 
+def _test_name_from_summary_line(line: str, head: str) -> str | None:
+    """The test named by one of pytest's short-summary lines.
+
+    Read `line.split("::")[-1].split()[0]` and it looks right until a test
+    fails on an assertion whose message contains a Rust module path. A summary
+    line is `FAILED <nodeid> - <message>`, the message here is a slice of
+    Warpgate's own log, and the log is full of `warpgate_common_http::logging`.
+    Splitting on the *last* `::` then returns a fragment of that message, the
+    test is not recognised as having failed, and the run records it as passed —
+    which is how four guards that discriminate were reported as guards that do
+    not. The nodeid is what to read, and it ends at the first ` - `.
+    """
+    nodeid = line[len(head):].strip().split(" - ", 1)[0].strip()
+    if not nodeid:
+        return None
+    # `test_x[a b]` is one nodeid with a space in it; the parameters are not
+    # part of the name a guard names.
+    return nodeid.split("::")[-1].split("[", 1)[0].strip() or None
+
+
 def _gateway_fingerprint() -> str | None:
     """Whether the binary the tests will run is the one just built.
 
@@ -877,7 +897,9 @@ def run_named_only(
         for line in result.stdout.splitlines():
             head = line.split(" ", 1)[0]
             if head in ("PASSED", "FAILED", "ERROR", "SKIPPED", "XFAIL", "XPASS"):
-                outcome[line.split("::")[-1].split()[0]] = head
+                name = _test_name_from_summary_line(line, head)
+                if name:
+                    outcome[name] = head
         for name in python:
             verdict = outcome.get(name)
             if verdict == "FAILED":
@@ -1135,9 +1157,13 @@ def failing_tests() -> tuple[set[str], str]:
     if "no tests ran" in result.stdout or "collected 0 items" in result.stdout:
         raise SystemExit(f"the suite collected nothing, so nothing was measured:\n{result.stdout[-500:]}")
     failed = {
-        line.split("::")[-1].split()[0]
+        name
         for line in result.stdout.splitlines()
         if line.startswith("FAILED")
+        # Same reason as in `run_named_only`: the last `::` on a summary line
+        # belongs to whatever Rust module path the assertion message quoted.
+        for name in [_test_name_from_summary_line(line, "FAILED")]
+        if name
     }
     return failed, result.stdout[-400:]
 
