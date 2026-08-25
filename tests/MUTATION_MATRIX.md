@@ -32,11 +32,19 @@ PYTHONPATH=$PWD poetry -C tests run python -m tests.mutation_matrix --named
 ... --named --fail-fast        # stop at the first guard that does not discriminate
 ```
 
-A full sweep is **over fourteen hours** on one machine: the run rebuilds the
-gateway binary for each of the guards pinned by integration tests. A
-GitHub-hosted job is killed at six hours, so the workflow shards the sweep
-eight ways and a summary job requires the shards to account for every guard in
-the table before it will call the result a sweep.
+A full sweep costs **2.55 machine-hours** — measured on run 32802468772, summing
+each shard's own duration — because the run rebuilds the gateway binary for each
+of the guards pinned by integration tests. The workflow shards it eight ways,
+which brings the wall clock to 28.8 minutes; the slowest shard was 28.6.
+
+Sharding is for latency, not feasibility. A single job would take about two and
+a half hours and fits inside GitHub's six-hour cap. This paragraph previously
+said a sweep was "over fourteen hours" and could not fit — that figure was wall
+clock from a laptop which spent seven and a half of those hours asleep, and the
+conclusion drawn from it was wrong.
+
+A summary job requires the shards to account for every guard in the table before
+it will call the result a sweep.
 
 ## Reading the artifact
 

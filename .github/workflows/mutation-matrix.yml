@@ -11,11 +11,14 @@
 #                   cannot see a guard broken in a file the change did not touch,
 #                   and it says so in its own output rather than leaving a green
 #                   check to imply otherwise.
-#   schedule      — all of them, split across eight parallel jobs. A sweep is
-#                   over fourteen hours on one machine and a GitHub-hosted job
-#                   is killed at six, so an unsharded "every guard" job could
-#                   only ever be started, never finished. Eight shards bring the
-#                   longest one to roughly two hours.
+#   schedule      — all of them, split across eight parallel jobs. Measured on
+#                   run 32802468772: 2.55 machine-hours of work, 28.8 minutes of
+#                   wall clock. Sharding buys the latency, not the feasibility —
+#                   a single job would take about two and a half hours and fit
+#                   inside GitHub's six-hour cap. An earlier version of this
+#                   comment claimed it would not fit, on a fourteen-hour figure
+#                   from a laptop that spent seven and a half of those hours
+#                   asleep.
 #
 # A shard's green check covers the guards in that shard and no others. Only the
 # summary job, which requires every shard, stands for the sweep.
@@ -45,9 +48,10 @@ jobs:
   guards:
     name: Guards discriminate
     runs-on: ubuntu-latest
-    # Long enough for the slowest shard, short enough that a hung run is killed
-    # rather than occupying a runner until the six-hour ceiling.
-    timeout-minutes: 300
+    # The slowest shard measured 28.6 minutes. This is deliberately far above
+    # that: it is a stop for a hung run, not a budget, and a guard that has
+    # genuinely got slower should fail on its own merits rather than here.
+    timeout-minutes: 120
     strategy:
       # One shard's failure is a real result about that shard. Cancelling the
       # others would throw away the verdicts already earned and leave a sweep
