@@ -182,5 +182,9 @@ jobs:
               sys.exit(f"only {len(seen)} of {defined} guards were measured — "
                        "this is not a sweep")
           if discriminating != defined:
-              sys.exit("a guard can be turned off without its own test noticing")
+              # Not always a coverage hole: `no verdict`, `no baseline` and
+              # `the mutation never reached the binary` mean the run could not
+              # measure the guard, which is a different problem with the same
+              # consequence — the sweep cannot claim the guard is pinned.
+              sys.exit("not every guard was shown to be pinned by its own test")
           EOF

@@ -46,6 +46,7 @@ by mistake because this docstring used to name it first.
 
 import ast
 import atexit
+import hashlib
 import json
 import pathlib
 import signal
@@ -791,8 +792,34 @@ def run(command, **kwargs):
     return subprocess.run(command, cwd=REPO, capture_output=True, text=True, **kwargs)
 
 
-def run_named_only(tests: list[str], crates=None) -> tuple[set[str], set[str]]:
-    """Run only the given tests. Returns (passed, failed), by name.
+def _gateway_fingerprint() -> str | None:
+    """Whether the binary the tests will run is the one just built.
+
+    An A/B where both halves ran the same binary is not an A/B, and it reports
+    `does not discriminate` — the guard\'s own test passing with the guard off —
+    which is indistinguishable from a real coverage hole. Two guards were
+    reported that way by the first CI sweep while both discriminated locally,
+    and nothing in the run recorded enough to tell the two explanations apart.
+    """
+    binary = REPO / "target" / "debug" / "warpgate"
+    if not binary.exists():
+        return None
+    digest = hashlib.sha256()
+    with binary.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()[:16]
+
+
+def run_named_only(
+    tests: list[str], crates=None
+) -> tuple[set[str], set[str], dict[str, str]]:
+    """Run only the given tests. Returns (passed, failed, unclear), by name.
+
+    `unclear` is the third answer this used to lack. A test can be skipped,
+    error in a fixture, be deselected, or never be collected at all, and none
+    of those is a pass — but all of them were recorded as one, because the
+    only thing read was the list of failures.
 
     The whole suite is not run. That is the point: `run_one` runs everything
     because it asks "which tests notice", and the answer to that question is
@@ -810,6 +837,7 @@ def run_named_only(tests: list[str], crates=None) -> tuple[set[str], set[str]]:
     """
     passed: set[str] = set()
     failed: set[str] = set()
+    unclear: dict[str, str] = {}
 
     crates = crates or list(RUST_CRATES)
     rust = [t for t in tests if not t.startswith("test_") or _is_rust(t, crates)]
@@ -833,21 +861,37 @@ def run_named_only(tests: list[str], crates=None) -> tuple[set[str], set[str]]:
 
     if python:
         result = subprocess.run(
-            ["poetry", "run", "pytest", *SUITES, "-q", "--tb=no", "-p", "no:randomly",
-             "-k", " or ".join(python)],
+            ["poetry", "run", "pytest", *SUITES, "-q", "--tb=no", "-rA",
+             "-p", "no:randomly", "-k", " or ".join(python)],
             cwd=REPO / "tests",
             capture_output=True,
             text=True,
         )
-        reported = {
-            line.split("::")[-1].split()[0]
-            for line in result.stdout.splitlines()
-            if line.startswith("FAILED")
-        }
+        # Classify explicitly. Reading only the `FAILED` lines and calling
+        # everything else passed made a skipped, errored, deselected or
+        # never-collected test indistinguishable from a passing one — the same
+        # confusion `failing_tests` already refuses for a whole suite, left open
+        # for a single test. `-rA` makes pytest state an outcome per test, and a
+        # name pytest never mentions is recorded as unknown rather than passed.
+        outcome = {}
+        for line in result.stdout.splitlines():
+            head = line.split(" ", 1)[0]
+            if head in ("PASSED", "FAILED", "ERROR", "SKIPPED", "XFAIL", "XPASS"):
+                outcome[line.split("::")[-1].split()[0]] = head
         for name in python:
-            (failed if name in reported else passed).add(name)
+            verdict = outcome.get(name)
+            if verdict == "FAILED":
+                failed.add(name)
+            elif verdict == "PASSED":
+                passed.add(name)
+            else:
+                unclear[name] = verdict or "never reported by pytest"
+        if unclear:
+            # Kept because the reason a test did not report is in pytest's own
+            # output, and every run so far has thrown that output away.
+            unclear["pytest output"] = result.stdout[-1200:]
 
-    return passed, failed
+    return passed, failed, unclear
 
 
 _RUST_TEST_CACHE: dict[str, dict[str, str]] = {}
@@ -985,12 +1029,24 @@ def verify_named(mutations, fail_fast=False):
             binary_is_mutated = False
 
         print(f"[{index:>2}/{total}]   baseline", flush=True)
-        before_pass, before_fail = run_named_only(expected, nearest)
+        before_pass, before_fail, before_unclear = run_named_only(expected, nearest)
         if before_fail:
             record({
                 "guard": name,
                 "status": "already failing",
                 "tests": sorted(before_fail),
+            })
+            continue
+        # The precondition is that the named test *passes* before the mutation.
+        # A test that was skipped, errored or never collected has not met it,
+        # and measuring the other half of the A/B against it produces a verdict
+        # about nothing. This used to read as a clean baseline.
+        if before_unclear:
+            record({
+                "guard": name,
+                "status": "no baseline",
+                "expected": expected,
+                "unclear_at_baseline": before_unclear,
             })
             continue
 
@@ -1001,26 +1057,46 @@ def verify_named(mutations, fail_fast=False):
         try:
             if needs_binary:
                 print(f"[{index:>2}/{total}]   building the gateway with the guard off", flush=True)
+                before_build = _gateway_fingerprint()
                 build = run(["cargo", "build", "--bin", "warpgate"])
                 binary_is_mutated = True
                 if build.returncode != 0:
                     record({"guard": name, "status": "did not compile"})
                     continue
+                after_build = _gateway_fingerprint()
+                if after_build is not None and after_build == before_build:
+                    record({
+                        "guard": name,
+                        "status": "the mutation never reached the binary",
+                        "expected": expected,
+                        "fingerprint": after_build,
+                        "build_output": build.stdout[-600:] + build.stderr[-600:],
+                    })
+                    continue
             print(f"[{index:>2}/{total}]   testing with the guard off", flush=True)
-            after_pass, after_fail = run_named_only(expected, nearest)
+            after_pass, after_fail, after_unclear = run_named_only(expected, nearest)
             # `all`, per A2: every test the entry names has to notice.
             status = (
                 "discriminates"
                 if set(expected) <= after_fail
+                else "no verdict"
+                if after_unclear
                 else "does not discriminate"
             )
-            record({
+            entry = {
                 "guard": name,
                 "status": status,
                 "expected": expected,
                 "failed_with_guard_off": sorted(after_fail),
                 "passed_with_guard_off": sorted(after_pass),
-            })
+            }
+            # Only for the verdicts that need explaining. A guard that
+            # discriminated needs no forensics; one that did not is exactly
+            # where the run has been unable to say why.
+            if status != "discriminates":
+                entry["unclear_with_guard_off"] = after_unclear
+                entry["gateway_built_for_this_guard"] = bool(needs_binary)
+            record(entry)
         finally:
             source.write_text(original)
             IN_FLIGHT.pop(str(source), None)
