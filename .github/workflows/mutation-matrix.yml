@@ -100,6 +100,15 @@ jobs:
         working-directory: tests
         run: make all
 
+      # The integration tests run `target/debug/warpgate`, and the matrix only
+      # ever builds it as a side effect of mutating it. Without this the first
+      # baseline in every shard ran against a binary that did not exist, which
+      # pytest reported as a fixture error — and the old outcome rule scored an
+      # error as a pass, so the run reported verdicts on guards it had never
+      # measured.
+      - name: Build the gateway
+        run: cargo build --bin warpgate
+
       - name: Install test deps
         working-directory: tests
         run: |
