@@ -56,7 +56,7 @@ jobs:
       - name: Probe
         working-directory: tests
         run: |
-          for i in $(seq 1 8); do
+          for i in $(seq 1 60); do
             echo "::group::iteration $i"
             TIMEOUT=120 poetry run pytest test_ours_pubkey_hostile.py -q --tb=short \
               || { echo "reproduced on the branch, iteration $i"; exit 1; }
