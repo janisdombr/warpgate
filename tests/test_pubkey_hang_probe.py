@@ -102,11 +102,11 @@ def test_a_target_that_never_finishes_its_banner_releases_the_client(
             f"{user.username}:{target.name}@localhost",
             "-p",
             str(wg.ssh_port),
-            # The client's own account of where it stopped. One -v, not three:
-            # at three the hang stopped appearing in forty iterations where
-            # twenty without it had reproduced, so the tracing itself is a
-            # participant. This is the least of it that still names the stage.
-            "-v",
+            # No tracing flag. The control: twenty iterations without one
+            # reproduced on the sixteenth, and eighty with -v or -vvv
+            # reproduced none. Either the tracing is a participant in the race
+            # or that first hit was luck, and only a run in the original shape
+            # tells them apart.
             *common_args,
             "ls /bin/sh",
             password="123",
