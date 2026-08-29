@@ -56,7 +56,7 @@ jobs:
       - name: Probe
         working-directory: tests
         run: |
-          for i in $(seq 1 60); do
+          for i in $(seq 1 120); do
             echo "::group::iteration $i"
             TIMEOUT=120 poetry run pytest test_upstream_hostile_target.py -q --tb=short \
               || { echo "reproduced on upstream, iteration $i"; exit 1; }

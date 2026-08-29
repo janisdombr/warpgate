@@ -2523,7 +2523,25 @@ impl ServerSession {
         // runs on the event loop.
         let _ = tokio::time::timeout(DISCONNECT_FLUSH_TIMEOUT, self.channel_writer.flush()).await;
 
-        self.session_handle = None;
+        // And then say the session is over.
+        //
+        // Closing the client's channels ends it whenever there are any. A
+        // session that fails before one is open has none to close — a target
+        // that never finishes its SSH banner is refused during the handshake,
+        // long before the client's channel request is answered — and then
+        // nothing at all is sent, so the client holds a connection that will
+        // never be written to again until something kills it.
+        //
+        // Bounded like the flush above, and for the same reason: this runs on
+        // the event loop, and a client that is not reading must not be able to
+        // hold it.
+        if let Some(handle) = self.session_handle.take() {
+            let _ = tokio::time::timeout(
+                DISCONNECT_FLUSH_TIMEOUT,
+                handle.disconnect(russh::Disconnect::ByApplication, String::new(), String::new()),
+            )
+            .await;
+        }
     }
 }
 
