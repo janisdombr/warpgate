@@ -1,4 +1,4 @@
-name: Upstream hang probe
+name: Upstream hostile targets
 
 # Fork-only, and deliberately based on upstream with no feature branch merged.
 #
@@ -56,10 +56,10 @@ jobs:
       - name: Probe
         working-directory: tests
         run: |
-          for i in $(seq 1 20); do
+          for i in $(seq 1 8); do
             echo "::group::iteration $i"
-            TIMEOUT=120 poetry run pytest test_upstream_hang_probe.py -q --tb=short \
+            TIMEOUT=120 poetry run pytest test_upstream_hostile_target.py -q --tb=short \
               || { echo "reproduced on upstream, iteration $i"; exit 1; }
             echo "::endgroup::"
           done
-          echo "twenty iterations on upstream, client always released"
+          echo "eight iterations of the whole hostile suite on upstream, client always released"
