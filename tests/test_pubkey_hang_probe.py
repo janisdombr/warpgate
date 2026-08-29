@@ -102,10 +102,11 @@ def test_a_target_that_never_finishes_its_banner_releases_the_client(
             f"{user.username}:{target.name}@localhost",
             "-p",
             str(wg.ssh_port),
-            # The client's own account of where it stopped. The gateway's log
-            # already says it closed the session in the same second; what is
-            # missing is which message the client was still waiting for.
-            "-vvv",
+            # The client's own account of where it stopped. One -v, not three:
+            # at three the hang stopped appearing in forty iterations where
+            # twenty without it had reproduced, so the tracing itself is a
+            # participant. This is the least of it that still names the stage.
+            "-v",
             *common_args,
             "ls /bin/sh",
             password="123",
