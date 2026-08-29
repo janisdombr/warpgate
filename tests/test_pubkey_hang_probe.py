@@ -8,6 +8,7 @@ upstream, so if it hangs here the difference is something this branch adds.
 """
 
 import socket
+import subprocess
 import threading
 from uuid import uuid4
 
@@ -101,6 +102,10 @@ def test_a_target_that_never_finishes_its_banner_releases_the_client(
             f"{user.username}:{target.name}@localhost",
             "-p",
             str(wg.ssh_port),
+            # The client's own account of where it stopped. The gateway's log
+            # already says it closed the session in the same second; what is
+            # missing is which message the client was still waiting for.
+            "-vvv",
             *common_args,
             "ls /bin/sh",
             password="123",
@@ -108,6 +113,15 @@ def test_a_target_that_never_finishes_its_banner_releases_the_client(
         # Forty seconds is past the gateway's own thirty-second handshake bound
         # with room to spare, so a client still running here is not waiting on
         # that bound — it is waiting on nothing.
-        client.communicate(timeout=40)
+        try:
+            client.communicate(timeout=40)
+        except subprocess.TimeoutExpired:
+            client.kill()
+            out, err = client.communicate(timeout=10)
+            print("---- ssh stdout ----")
+            print(out.decode(errors="replace")[-3000:])
+            print("---- ssh stderr (last 120 lines) ----")
+            print("\n".join(err.decode(errors="replace").splitlines()[-120:]))
+            raise
     finally:
         server.stop()

@@ -56,9 +56,9 @@ jobs:
       - name: Probe
         working-directory: tests
         run: |
-          for i in $(seq 1 20); do
+          for i in $(seq 1 40); do
             echo "::group::iteration $i"
-            TIMEOUT=120 poetry run pytest test_pubkey_hang_probe.py -q --tb=short \
+            TIMEOUT=120 poetry run pytest test_pubkey_hang_probe.py -q --tb=short -s \
               || { echo "reproduced on the branch, iteration $i"; exit 1; }
             echo "::endgroup::"
           done
