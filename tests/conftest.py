@@ -1124,6 +1124,11 @@ _NOISE = (
     "runtime.spawn",
     "runtime::resource",
     "tokio::task",
+    # The config watcher reports the data directory every ten seconds whether
+    # or not anything happened, so a gateway that sat idle through a hung test
+    # ends its log in these and nothing else.
+    "notify::",
+    "inotify event",
 )
 
 
