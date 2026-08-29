@@ -14,6 +14,8 @@ from pathlib import Path
 from uuid import uuid4
 
 import psutil
+import subprocess
+
 import pytest
 import yaml
 
@@ -149,8 +151,20 @@ def start(processes: ProcessManager, wg: WarpgateProcess, user, target, *extra):
 
 
 def connect(processes: ProcessManager, wg: WarpgateProcess, user, target, timeout, *extra):
-    client = start(processes, wg, user, target, *extra)
-    stdout = client.communicate(timeout=timeout)[0]
+    client = start(processes, wg, user, target, "-v", *extra)
+    try:
+        stdout = client.communicate(timeout=timeout)[0]
+    except subprocess.TimeoutExpired:
+        # Fork-only instrumentation. The gateway's log already shows it closing
+        # the session in the same second; this is the other half — the stage the
+        # client was still waiting at when its patience ran out.
+        client.kill()
+        out, err = client.communicate(timeout=10)
+        print("---- ssh stdout ----")
+        print(out.decode(errors="replace")[-2000:])
+        print("---- ssh stderr ----")
+        print("\n".join(err.decode(errors="replace").splitlines()[-80:]))
+        raise
     return client.returncode, stdout
 
 

@@ -62,7 +62,7 @@ jobs:
             echo "::group::iteration $i"
             TIMEOUT=120 poetry run pytest \
               test_vault_hostile_target.py test_vault_hostile_certs.py \
-              -q --tb=short -p no:randomly || { echo "reproduced on iteration $i"; exit 1; }
+              -q --tb=short -s -p no:randomly || { echo "reproduced on iteration $i"; exit 1; }
             echo "::endgroup::"
           done
           echo "twenty iterations, no reproduction"
