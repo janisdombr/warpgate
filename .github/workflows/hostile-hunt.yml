@@ -1,0 +1,68 @@
+name: Hostile hunt
+
+# Fork-only. Not part of PR #2397 — this branch exists to reproduce an
+# intermittent hang in the hostile-target suite that appears on Linux CI and
+# never locally, at roughly one full run in four. The full suite takes forty
+# minutes to tell us nothing; this one runs the two hostile suites twenty times
+# in a row, which is the same signal in a fraction of the wall clock.
+
+on:
+  push:
+    branches: [ "tooling/hostile-hunt" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: "test"
+
+      - name: Install build deps
+        run: |
+          sudo apt-get install openssh-client expect
+          cargo install --locked just@1.4.0
+
+      - name: Build UI
+        run: |
+          just npm ci
+          just openapi
+          just npm run openapi:tests-sdk
+          just npm run build
+
+      - name: Build the gateway
+        run: cargo build --bin warpgate
+
+      - name: Build images
+        working-directory: tests
+        run: make all
+
+      - name: Install deps
+        working-directory: tests
+        run: |
+          pip3 install poetry==1.8.3
+          poetry install
+
+      - name: Hunt
+        working-directory: tests
+        run: |
+          for i in $(seq 1 20); do
+            echo "::group::iteration $i"
+            TIMEOUT=120 poetry run pytest \
+              test_vault_hostile_target.py test_vault_hostile_certs.py \
+              -q --tb=short -p no:randomly || { echo "reproduced on iteration $i"; exit 1; }
+            echo "::endgroup::"
+          done
+          echo "twenty iterations, no reproduction"
