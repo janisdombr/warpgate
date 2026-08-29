@@ -1,65 +1,57 @@
-name: Upstream hostile targets
+name: Recording stall hunt
 
-# Fork-only, and deliberately based on upstream with no feature branch merged.
-#
-# The question: when a target never finishes its SSH banner, warpgate detects
-# it and closes its own session within the same second — the log says so — but
-# is the connecting user's `ssh` released? On Linux CI that sometimes does not
-# happen. This runs the probe twenty times on upstream alone, so an answer
-# cannot be attributed to anything unmerged.
+# Fork-only. `test_terminal_recording_index` fails on this project's own main in
+# roughly a quarter of runs, and its failure says only that the client did not
+# finish. This runs the transfer alone, repeatedly, and reports how far it got.
 
 on:
   push:
-    branches: [ "tooling/upstream-hang-probe" ]
+    branches: [ "tooling/recording-stall" ]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  probe:
+  hunt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
-
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: 24
-
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           key: "test"
-
       - name: Install build deps
         run: |
           sudo apt-get install openssh-client expect
           cargo install --locked just@1.4.0
-
       - name: Build UI
         run: |
           just npm ci
           just openapi
           just npm run openapi:tests-sdk
           just npm run build
-
       - name: Build the gateway
         run: cargo build --bin warpgate
-
+      - name: Build images
+        working-directory: tests
+        run: make all
       - name: Install deps
         working-directory: tests
         run: |
           pip3 install poetry==1.8.3
           poetry install
-
-      - name: Probe
+      - name: Hunt
         working-directory: tests
         run: |
-          for i in $(seq 1 120); do
-            echo "::group::iteration $i"
-            TIMEOUT=120 poetry run pytest test_upstream_hostile_target.py -q --tb=short \
-              || { echo "reproduced on upstream, iteration $i"; exit 1; }
-            echo "::endgroup::"
+          fails=0
+          for i in $(seq 1 20); do
+            TIMEOUT=120 poetry run pytest test_recording_stall.py -q -s --tb=line \
+              || fails=$((fails+1))
           done
-          echo "eight iterations of the whole hostile suite on upstream, client always released"
+          echo "stalls: $fails of 20"
+          [ "$fails" = "0" ] || exit 1
