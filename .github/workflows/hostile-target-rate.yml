@@ -1,0 +1,115 @@
+name: Hostile-target hang rate
+
+# Fork-only throwaway CI harness. Not proposed upstream, not part of any
+# long-lived branch, and this workflow exists on `flake/hostile-target-rate`
+# and nowhere else.
+#
+# Measures the rate of https://github.com/warp-tech/warpgate/issues/2520 on
+# Linux CI: a target that sends garbage right after its SSH banner is detected
+# and closed by the gateway inside the same second, and every so often the
+# connecting `ssh` client is never released and is still there when the
+# harness kills it. Locally on macOS this reproduces about 2 times in 400 full
+# runs of the equivalent test; it has reproduced once in fork CI before. There
+# is no observed slow-but-passing case — a run either finishes within a couple
+# of seconds of the target going hostile, or it does not finish until killed.
+# See tests/test_flake_hostile_target_rate.py for the full write-up and for
+# what "the rate" and "the evidence" mean here.
+#
+# Sharded so one push stays well inside GitHub's 6h workflow limit: each shard
+# is an independent job running its own slice of iterations, so wall-clock is
+# whatever the slowest single shard takes, not the sum of all of them.
+
+on:
+  push:
+    branches: [ "flake/hostile-target-rate" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    # Generous relative to the expected wall-clock (see the harness's own
+    # docstring for the iteration-cost estimate this was sized from) — this is
+    # a backstop against a genuinely stuck runner, not the number the harness
+    # is expected to take.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 shards: GitHub's free-tier concurrent-job limit, so a push gets
+        # this many iterations running in parallel rather than queued.
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    env:
+      # There is no observed slow-but-passing run of this flake (see the
+      # module docstring in test_flake_hostile_target_rate.py): a client is
+      # either released within a couple of seconds of the target going
+      # hostile, or it is not released at all. 15s gives roughly an order of
+      # magnitude of margin over that fast path — enough that ordinary CI
+      # scheduling jitter under 20 parallel shards cannot be mistaken for a
+      # hang — while staying small enough that the ~20 hangs this run expects
+      # (4-6k attempts at ~0.5%) cost minutes, not hours, of wasted wait time.
+      TIMEOUT: "15"
+      ITERATIONS: "300"
+      SHARD_ID: ${{ matrix.shard }}
+      ARTIFACT_DIR: hostile-rate-artifacts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          # Own cache key: this is throwaway tooling and must not pollute, or
+          # be evicted by, the real Test workflow's cache.
+          key: "hostile-target-rate"
+
+      - name: Install build deps
+        run: |
+          sudo apt-get install openssh-client
+          cargo install --locked just@1.4.0
+
+      - name: Build UI
+        run: |
+          just npm ci
+          just openapi
+          just npm run openapi:tests-sdk
+          just npm run build
+
+      - name: Build the gateway
+        run: cargo build --bin warpgate
+
+      - name: Install Python deps
+        working-directory: tests
+        run: |
+          pip3 install poetry==1.8.3
+          poetry install
+
+      - name: Measure
+        working-directory: tests
+        run: |
+          poetry run pytest test_flake_hostile_target_rate.py -q -s --tb=short -p no:randomly
+
+      # No `if: always()` gate on a pass/fail check: the harness itself never
+      # fails the step (see the module docstring — a hang is the
+      # measurement, not an error), so this only needs to run when the step
+      # above actually produced output. It still gets `if: always()` so that a
+      # partial run (e.g. the job hit `timeout-minutes`) uploads whatever
+      # evidence had already been written.
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@2848b2cda0e5190984587ec6bb1f36730ca78d50
+        with:
+          name: hostile-rate-shard-${{ matrix.shard }}
+          path: tests/${{ env.ARTIFACT_DIR }}
+          if-no-files-found: warn
+          retention-days: 14
