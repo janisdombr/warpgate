@@ -62,9 +62,17 @@ const EVENT_QUEUE_CAPACITY: usize = 128;
 /// concurrent channel requests can't grow the stack without bound.
 const MAX_NESTED_COMMAND_WAITS: usize = 16;
 
-/// How long a teardown waits for queued writes to reach the client before
+/// How long a teardown waits for the channel writer's own queue to drain —
+/// i.e. for `Handle::close`/`Handle::disconnect` to have been *sent* — before
 /// giving up on them.
 const DISCONNECT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A send into `Handle` only proves russh's session task accepted the
+/// message into its own queue, never that it acted on it (see
+/// `disconnect_server`). There is nothing in the API to await for that, so
+/// this is a fixed sleep rather than a `timeout` on some fallible operation:
+/// unlike waiting on a client's window, a plain sleep cannot itself hang.
+const DISCONNECT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 #[allow(clippy::large_enum_variant)]
 enum TargetSelection {
@@ -1220,14 +1228,12 @@ impl ServerSession {
                 // PROBE (fork-only, not for upstream): which of the two
                 // conditions swallows the close on the hanging runs.
                 match self.client_channel(&channel) {
-                    Ok(Some((handle, id))) => {
-                        match self.channel_writer.close(handle, id) {
-                            Ok(()) => tracing::warn!(%channel, "TRACE 3 close_enqueued"),
-                            Err(error) => {
-                                tracing::warn!(%channel, %error, "TRACE 3 close_enqueue_failed")
-                            }
+                    Ok(Some((handle, id))) => match self.channel_writer.close(handle, id) {
+                        Ok(()) => tracing::warn!(%channel, "TRACE 3 close_enqueued"),
+                        Err(error) => {
+                            tracing::warn!(%channel, %error, "TRACE 3 close_enqueue_failed")
                         }
-                    }
+                    },
                     Ok(None) => {
                         tracing::warn!(%channel, "PROBE close_skipped_no_session_handle");
                     }
@@ -2537,17 +2543,43 @@ impl ServerSession {
             .filter_map(Channel::server_id)
             .collect::<Vec<_>>();
 
+        let had_handle = self.session_handle.is_some();
         if let Some(handle) = self.session_handle.clone() {
             for ch in channels {
                 let _ = self.channel_writer.close(handle.clone(), ch.0);
             }
+            // A channel close only ends that channel — it says nothing about
+            // the *connection*, so a dead target never gives the client a
+            // reason to let go of the socket (#2520). Queue an actual
+            // protocol disconnect behind the channel closes so relative
+            // ordering holds. `ByApplication` matches the reason already
+            // used for the client-facing leg's own teardown
+            // (`client/mod.rs::disconnect`): Warpgate is ending the session
+            // on its own initiative, not reporting a wire protocol error.
+            let _ = self.channel_writer.disconnect(
+                handle,
+                russh::Disconnect::ByApplication,
+                String::new(),
+                String::new(),
+            );
         }
 
-        // Give queued writes — the closes above, and any error or timeout
-        // notice emitted before them — a chance to reach the client. Bounded:
-        // a client whose window is full never lets the queue drain, and this
-        // runs on the event loop.
+        // Give the channel writer's own queue a chance to hand the closes and
+        // the disconnect above (and any error or timeout notice emitted
+        // before them) off to russh. Bounded: a client whose window is full
+        // never lets the queue drain, and this runs on the event loop.
         let _ = tokio::time::timeout(DISCONNECT_FLUSH_TIMEOUT, self.channel_writer.flush()).await;
+
+        // `flush()` only proves the above reached russh's `Handle`, i.e. that
+        // `Handle::close`/`Handle::disconnect` returned — not that russh's
+        // own session task, which runs independently of this one, has had a
+        // turn to actually write them. Processing the disconnect is what
+        // makes that task exit its loop and shut the stream down, so give it
+        // one short, fixed opportunity to do that before this session lets
+        // go of the handle for good.
+        if had_handle {
+            tokio::time::sleep(DISCONNECT_DRAIN_GRACE).await;
+        }
 
         self.session_handle = None;
     }

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
-use russh::ChannelId;
 use russh::server::Handle;
+use russh::{ChannelId, Disconnect};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 /// How much target output may be outstanding towards the client at once.
@@ -29,6 +29,10 @@ enum ChannelWriteOperation {
     ),
     Eof(Handle, ChannelId),
     Close(Handle, ChannelId),
+    /// Connection-level, not channel-scoped, but it still needs to be
+    /// ordered after any channel closes queued ahead of it — hence living in
+    /// the same queue rather than being sent to `Handle` directly.
+    Disconnect(Handle, Disconnect, String, String),
     Success(Handle, ChannelId),
     Failure(Handle, ChannelId),
     ExitStatus(Handle, ChannelId, u32),
@@ -57,10 +61,12 @@ impl ChannelWriter {
                 // TRACE (fork-only). Data is per-byte and would flood; every
                 // other operation is one per request or per channel.
                 let traced = match &operation {
-                    ChannelWriteOperation::Data(..)
-                    | ChannelWriteOperation::ExtendedData(..) => None,
+                    ChannelWriteOperation::Data(..) | ChannelWriteOperation::ExtendedData(..) => {
+                        None
+                    }
                     ChannelWriteOperation::Eof(..) => Some("eof"),
                     ChannelWriteOperation::Close(..) => Some("close"),
+                    ChannelWriteOperation::Disconnect(..) => Some("disconnect"),
                     ChannelWriteOperation::Success(..) => Some("success"),
                     ChannelWriteOperation::Failure(..) => Some("failure"),
                     ChannelWriteOperation::ExitStatus(..) => Some("exit_status"),
@@ -88,6 +94,25 @@ impl ChannelWriter {
                             Err(_) => {
                                 tracing::warn!(?channel, "TRACE 5 close_rejected_by_russh")
                             }
+                        }
+                    }
+                    ChannelWriteOperation::Disconnect(
+                        handle,
+                        reason,
+                        description,
+                        language_tag,
+                    ) => {
+                        // Same fire-and-forget shape as `Close` above: a
+                        // successful send only means russh's session task
+                        // accepted the message into its own queue, not that
+                        // it reached the socket. What actually differs is
+                        // what processing it does once dequeued — dispatching
+                        // a `Disconnect` is what makes russh's session loop
+                        // exit and shut the stream down, which dispatching a
+                        // channel `Close` never does.
+                        match handle.disconnect(reason, description, language_tag).await {
+                            Ok(()) => tracing::warn!("TRACE 5 disconnect_accepted_by_russh"),
+                            Err(_) => tracing::warn!("TRACE 5 disconnect_rejected_by_russh"),
                         }
                     }
                     ChannelWriteOperation::Success(handle, channel) => {
@@ -178,6 +203,26 @@ impl ChannelWriter {
 
     pub fn close(&self, handle: Handle, channel: ChannelId) -> Result<()> {
         self.enqueue(ChannelWriteOperation::Close(handle, channel))
+    }
+
+    /// A channel `Close` only ends that channel; it never tells the client
+    /// the *connection* is over, so nothing obliges a well-behaved client to
+    /// let go of the socket. This is the operation that does: queue it after
+    /// the channel closes it's meant to follow, and once dequeued it forces
+    /// russh's own session loop to end and shut the stream down.
+    pub fn disconnect(
+        &self,
+        handle: Handle,
+        reason: Disconnect,
+        description: String,
+        language_tag: String,
+    ) -> Result<()> {
+        self.enqueue(ChannelWriteOperation::Disconnect(
+            handle,
+            reason,
+            description,
+            language_tag,
+        ))
     }
 
     pub fn channel_success(&self, handle: Handle, channel: ChannelId) -> Result<()> {
