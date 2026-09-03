@@ -54,6 +54,22 @@ impl ChannelWriter {
         let (tx, mut rx) = mpsc::unbounded_channel::<ChannelWriteOperation>();
         tokio::spawn(async move {
             while let Some(operation) = rx.recv().await {
+                // TRACE (fork-only). Data is per-byte and would flood; every
+                // other operation is one per request or per channel.
+                let traced = match &operation {
+                    ChannelWriteOperation::Data(..)
+                    | ChannelWriteOperation::ExtendedData(..) => None,
+                    ChannelWriteOperation::Eof(..) => Some("eof"),
+                    ChannelWriteOperation::Close(..) => Some("close"),
+                    ChannelWriteOperation::Success(..) => Some("success"),
+                    ChannelWriteOperation::Failure(..) => Some("failure"),
+                    ChannelWriteOperation::ExitStatus(..) => Some("exit_status"),
+                    ChannelWriteOperation::ExitSignal(..) => Some("exit_signal"),
+                    ChannelWriteOperation::Flush(..) => Some("flush"),
+                };
+                if let Some(op) = traced {
+                    tracing::warn!(op, "TRACE 4 writer_dequeued");
+                }
                 match operation {
                     ChannelWriteOperation::Data(handle, channel, data, _slot) => {
                         let _ = handle.data(channel, data).await;
@@ -68,9 +84,9 @@ impl ChannelWriter {
                         // PROBE2 (fork-only): every result in this loop is
                         // discarded. Say what the close actually returned.
                         match handle.close(channel).await {
-                            Ok(()) => tracing::warn!(?channel, "PROBE2 close_delivered"),
+                            Ok(()) => tracing::warn!(?channel, "TRACE 5 close_accepted_by_russh"),
                             Err(_) => {
-                                tracing::warn!(?channel, "PROBE2 close_rejected_by_russh")
+                                tracing::warn!(?channel, "TRACE 5 close_rejected_by_russh")
                             }
                         }
                     }
@@ -100,7 +116,7 @@ impl ChannelWriter {
                     }
                 }
             }
-            tracing::warn!("PROBE2 writer_task_exited");
+            tracing::warn!("TRACE 7 writer_task_exited");
         });
         Self {
             tx,

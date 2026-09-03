@@ -167,7 +167,9 @@ impl SessionChannel {
     /// the close is discarded, and the client is never told its channel is over.
     async fn close_and_wait(&mut self) {
         if !self.closed {
-            let _ = self.events_tx.send(RCEvent::Close(self.channel_id)).await;
+            let sent = self.events_tx.send(RCEvent::Close(self.channel_id)).await;
+            tracing::warn!(channel = %self.channel_id, ok = sent.is_ok(),
+                "TRACE 1 close_emitted_by_client_side");
             self.closed = true;
         }
     }

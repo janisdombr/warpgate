@@ -55,7 +55,7 @@ jobs:
       # hang — while staying small enough that the ~20 hangs this run expects
       # (4-6k attempts at ~0.5%) cost minutes, not hours, of wasted wait time.
       TIMEOUT: "15"
-      ITERATIONS: "300"
+      ITERATIONS: "150"
       SHARD_ID: ${{ matrix.shard }}
       ARTIFACT_DIR: hostile-rate-artifacts
     steps:

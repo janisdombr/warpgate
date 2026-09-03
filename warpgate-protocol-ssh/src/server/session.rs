@@ -369,6 +369,7 @@ impl ServerSession {
                     }
                 }
             };
+            tracing::warn!("TRACE 6 session_event_loop_exited");
             debug!("No more events");
             this.settle_failed_probe().await;
             result?;
@@ -1215,12 +1216,16 @@ impl ServerSession {
                 }
             }
             RCEvent::Close(channel) => {
+                tracing::warn!(%channel, "TRACE 2 close_reached_session_loop");
                 // PROBE (fork-only, not for upstream): which of the two
                 // conditions swallows the close on the hanging runs.
                 match self.client_channel(&channel) {
                     Ok(Some((handle, id))) => {
-                        if let Err(error) = self.channel_writer.close(handle, id) {
-                            tracing::warn!(%channel, %error, "PROBE close_write_failed");
+                        match self.channel_writer.close(handle, id) {
+                            Ok(()) => tracing::warn!(%channel, "TRACE 3 close_enqueued"),
+                            Err(error) => {
+                                tracing::warn!(%channel, %error, "TRACE 3 close_enqueue_failed")
+                            }
                         }
                     }
                     Ok(None) => {
