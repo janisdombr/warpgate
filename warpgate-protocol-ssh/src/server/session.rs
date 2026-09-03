@@ -1215,8 +1215,29 @@ impl ServerSession {
                 }
             }
             RCEvent::Close(channel) => {
-                if let Ok(Some((handle, id))) = self.client_channel(&channel) {
-                    let _ = self.channel_writer.close(handle, id);
+                // PROBE (fork-only, not for upstream): which of the two
+                // conditions swallows the close on the hanging runs.
+                match self.client_channel(&channel) {
+                    Ok(Some((handle, id))) => {
+                        if let Err(error) = self.channel_writer.close(handle, id) {
+                            tracing::warn!(%channel, %error, "PROBE close_write_failed");
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!(%channel, "PROBE close_skipped_no_session_handle");
+                    }
+                    Err(error) => {
+                        let known = self.channels.get(&channel).is_some();
+                        let has_server_id = self
+                            .channels
+                            .get(&channel)
+                            .and_then(Channel::server_id)
+                            .is_some();
+                        tracing::warn!(
+                            %channel, known, has_server_id, %error,
+                            "PROBE close_skipped_lookup_failed"
+                        );
+                    }
                 }
                 self.channels.close(channel);
             }
