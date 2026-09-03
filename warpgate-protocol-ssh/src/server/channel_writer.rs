@@ -65,7 +65,14 @@ impl ChannelWriter {
                         let _ = handle.eof(channel).await;
                     }
                     ChannelWriteOperation::Close(handle, channel) => {
-                        let _ = handle.close(channel).await;
+                        // PROBE2 (fork-only): every result in this loop is
+                        // discarded. Say what the close actually returned.
+                        match handle.close(channel).await {
+                            Ok(()) => tracing::warn!(?channel, "PROBE2 close_delivered"),
+                            Err(_) => {
+                                tracing::warn!(?channel, "PROBE2 close_rejected_by_russh")
+                            }
+                        }
                     }
                     ChannelWriteOperation::Success(handle, channel) => {
                         let _ = handle.channel_success(channel).await;
@@ -93,6 +100,7 @@ impl ChannelWriter {
                     }
                 }
             }
+            tracing::warn!("PROBE2 writer_task_exited");
         });
         Self {
             tx,
