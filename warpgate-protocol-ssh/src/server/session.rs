@@ -1215,8 +1215,17 @@ impl ServerSession {
                 }
             }
             RCEvent::Close(channel) => {
-                if let Ok(Some((handle, id))) = self.client_channel(&channel) {
-                    let _ = self.channel_writer.close(handle, id);
+                match self.client_channel(&channel) {
+                    Ok(Some((handle, id))) => self.channel_writer.close(handle, id)?,
+                    Ok(None) => {}
+                    Err(error) => {
+                        // Unlike the other arms, an unknown channel here isn't
+                        // necessarily a bug: `ChannelRegistry::close` is reached
+                        // from both the client and the target side, so the
+                        // registry entry may already be gone if the client half
+                        // of the close raced ahead of this target-side event.
+                        debug!(%channel, ?error, "Target closed a channel already gone from the registry");
+                    }
                 }
                 self.channels.close(channel);
             }
