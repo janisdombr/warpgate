@@ -67,12 +67,6 @@ const MAX_NESTED_COMMAND_WAITS: usize = 16;
 /// giving up on them.
 const DISCONNECT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A send into `Handle` only proves russh's session task accepted the
-/// message into its own queue, never that it acted on it (see
-/// `disconnect_server`). There is nothing in the API to await for that, so
-/// this is a fixed sleep rather than a `timeout` on some fallible operation:
-/// unlike waiting on a client's window, a plain sleep cannot itself hang.
-const DISCONNECT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 #[allow(clippy::large_enum_variant)]
 enum TargetSelection {
@@ -2577,9 +2571,7 @@ impl ServerSession {
         // makes that task exit its loop and shut the stream down, so give it
         // one short, fixed opportunity to do that before this session lets
         // go of the handle for good.
-        if had_handle {
-            tokio::time::sleep(DISCONNECT_DRAIN_GRACE).await;
-        }
+        let _ = had_handle;
 
         self.session_handle = None;
     }
