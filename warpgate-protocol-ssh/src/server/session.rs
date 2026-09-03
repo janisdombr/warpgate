@@ -67,6 +67,13 @@ const MAX_NESTED_COMMAND_WAITS: usize = 16;
 /// giving up on them.
 const DISCONNECT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Ceiling on how long a teardown waits for `protocol_done_rx` — i.e. for
+/// russh's own session loop to actually exit — once it's known safe to wait
+/// at all (see `disconnect_server`). Bounds a real signal rather than
+/// standing in for one: the wait normally ends the moment the signal fires,
+/// this only covers the case where it doesn't (a wedged protocol task, or a
+/// legitimately slow client during the final stream shutdown).
+const DISCONNECT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 #[allow(clippy::large_enum_variant)]
 enum TargetSelection {
@@ -168,6 +175,11 @@ pub struct ServerSession {
     allowed_auth_methods: MethodSet,
     /// Track the state of a client snooping around pre-auth
     probe: ProbeState,
+    /// Fires once when the wire protocol task's own `run()` loop has exited,
+    /// i.e. russh has (tried to) shut the stream down for good. `disconnect_server`
+    /// waits on it instead of guessing how long that takes with a sleep (#2520).
+    /// `None` once consumed — it's only ever worth waiting on the first time.
+    protocol_done_rx: Option<oneshot::Receiver<()>>,
 }
 
 fn session_debug_tag(id: &UserSessionId, remote_address: &SocketAddr) -> String {
@@ -242,6 +254,7 @@ impl ServerSession {
         server_handle: Arc<Mutex<WarpgateServerHandle>>,
         mut session_handle_rx: UnboundedReceiver<SessionHandleCommand>,
         mut handler_event_rx: UnboundedReceiver<ServerHandlerEvent>,
+        protocol_done_rx: oneshot::Receiver<()>,
     ) -> Result<impl Future<Output = Result<()>> + use<>> {
         let id = server_handle.lock().await.user_session_id();
 
@@ -286,6 +299,7 @@ impl ServerSession {
             cached_successful_ticket_auth: None,
             allowed_auth_methods: get_allowed_auth_methods(services).await?,
             probe: ProbeState::NoAttempt,
+            protocol_done_rx: Some(protocol_done_rx),
         };
 
         let mut so_rx = this.service_output.subscribe();
@@ -2568,10 +2582,32 @@ impl ServerSession {
         // `Handle::close`/`Handle::disconnect` returned — not that russh's
         // own session task, which runs independently of this one, has had a
         // turn to actually write them. Processing the disconnect is what
-        // makes that task exit its loop and shut the stream down, so give it
-        // one short, fixed opportunity to do that before this session lets
-        // go of the handle for good.
-        let _ = had_handle;
+        // makes that task exit its loop and shut the stream down, so wait
+        // for `protocol_done_rx` — fired from that task once it actually has
+        // — rather than guessing how long that takes with a sleep (#2520).
+        //
+        // Only when this call isn't nested inside `send_command_and_wait`'s
+        // own pump (`command_wait_depth == 0`), because every russh handler
+        // callback that carries a reply (`ChannelClose`, `Data`, ...) blocks
+        // on it from *inside* russh's own session task, and some of those
+        // replies are sent only once a nested pump — reached from here
+        // through `_channel_close` and friends — drains. Waiting on
+        // `protocol_done_rx` from there can never resolve before
+        // `DISCONNECT_DRAIN_GRACE` expires: russh cannot reach the code that
+        // would send the reply the pump is blocked on, because it is stuck
+        // in the callback waiting for that very reply. The timeout keeps that
+        // case from hanging forever, but at that point it is a bound on a
+        // wait already known to be pointless, not a real signal — the same
+        // fixed delay this replaces, just scoped to the one case where a
+        // signal genuinely can't help. The top-level call (the common case,
+        // and the one #2520 is about) has no such reply outstanding, so it
+        // resolves as soon as russh actually finishes.
+        if had_handle
+            && self.command_wait_depth == 0
+            && let Some(protocol_done_rx) = self.protocol_done_rx.take()
+        {
+            let _ = tokio::time::timeout(DISCONNECT_DRAIN_GRACE, protocol_done_rx).await;
+        }
 
         self.session_handle = None;
     }
