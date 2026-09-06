@@ -202,6 +202,8 @@ impl russh::client::Handler for ClientHandler {
 
 impl Drop for ClientHandler {
     fn drop(&mut self) {
+        // STALLCHAIN-INSTRUMENTATION: throwaway, strip before committing.
+        info!(t_ms = crate::stallchain_ms(), session=%self.session_id, "STALLCHAIN ClientHandler dropped, sending ClientHandlerEvent::Disconnect");
         let _ = self.event_tx.send(ClientHandlerEvent::Disconnect);
         debug!(session=%self.session_id, "Dropped");
     }

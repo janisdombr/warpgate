@@ -323,10 +323,22 @@ impl ServerSession {
             let sender = event_sender.clone();
             async move {
                 while let Some(e) = rc_handles.event_rx.recv().await {
+                    // STALLCHAIN-INSTRUMENTATION: throwaway, strip before committing.
+                    let sc_noisy =
+                        matches!(e, RCEvent::Output(..) | RCEvent::ExtendedData { .. });
+                    let sc_desc = if sc_noisy { String::new() } else { format!("{e:?}") };
+                    if !sc_noisy {
+                        info!(t_ms = crate::stallchain_ms(), event = %sc_desc, "STALLCHAIN rcevent->hub enter");
+                    }
                     if sender.send_once(Event::Client(e)).await.is_err() {
+                        info!(t_ms = crate::stallchain_ms(), "STALLCHAIN rcevent->hub send failed, forwarder ending");
                         break;
                     }
+                    if !sc_noisy {
+                        info!(t_ms = crate::stallchain_ms(), event = %sc_desc, "STALLCHAIN rcevent->hub exit");
+                    }
                 }
+                info!(t_ms = crate::stallchain_ms(), "STALLCHAIN rcevent forwarder task ended");
             }
         })?;
 
@@ -361,6 +373,7 @@ impl ServerSession {
                     }
                     Ok(None) => break Ok(()),
                     Err(_) => {
+                        info!(t_ms = crate::stallchain_ms(), "STALLCHAIN inactivity timeout fired");
                         info!("Closing the session due to inactivity");
                         let _ = this.emit_service_message("Closing the session due to inactivity");
                         this.request_disconnect();
@@ -369,6 +382,7 @@ impl ServerSession {
                     }
                 }
             };
+            info!(t_ms = crate::stallchain_ms(), "STALLCHAIN session loop ended");
             debug!("No more events");
             this.settle_failed_probe().await;
             result?;
@@ -730,6 +744,16 @@ impl ServerSession {
         event: Event,
     ) -> Pin<Box<dyn Future<Output = Result<(), WarpgateError>> + Send + 'a>> {
         async move {
+            // STALLCHAIN-INSTRUMENTATION: throwaway, strip before committing.
+            if !matches!(
+                event,
+                Event::Client(RCEvent::Output(..) | RCEvent::ExtendedData { .. })
+                    | Event::ConsoleInput(_)
+                    | Event::ServiceOutput(_)
+                    | Event::MenuRedraw(..)
+            ) {
+                info!(t_ms = crate::stallchain_ms(), event = ?event, "STALLCHAIN loop-received-event");
+            }
             match event {
                 Event::Client(RCEvent::Done) => Err(WarpgateError::SessionEnd)?,
                 Event::ServerHandler(ServerHandlerEvent::Disconnect) => {
@@ -2500,6 +2524,8 @@ impl ServerSession {
     }
 
     async fn disconnect_server(&mut self) {
+        // STALLCHAIN-INSTRUMENTATION: throwaway, strip before committing.
+        info!(t_ms = crate::stallchain_ms(), "STALLCHAIN disconnect_server enter");
         // Entries stay in place: several callers return into the running event
         // loop, which still needs the channels to record trailing output and to
         // map target events back to the client. Closing twice is harmless —
@@ -2521,14 +2547,19 @@ impl ServerSession {
         // notice emitted before them — a chance to reach the client. Bounded:
         // a client whose window is full never lets the queue drain, and this
         // runs on the event loop.
-        let _ = tokio::time::timeout(DISCONNECT_FLUSH_TIMEOUT, self.channel_writer.flush()).await;
+        info!(t_ms = crate::stallchain_ms(), "STALLCHAIN disconnect_server flushing");
+        let sc_flush =
+            tokio::time::timeout(DISCONNECT_FLUSH_TIMEOUT, self.channel_writer.flush()).await;
+        info!(t_ms = crate::stallchain_ms(), flush_ok = sc_flush.is_ok(), "STALLCHAIN disconnect_server flushed");
 
         self.session_handle = None;
+        info!(t_ms = crate::stallchain_ms(), "STALLCHAIN disconnect_server exit");
     }
 }
 
 impl Drop for ServerSession {
     fn drop(&mut self) {
+        info!(t_ms = crate::stallchain_ms(), "STALLCHAIN ServerSession dropped");
         let _ = self.rc_abort_tx.send(());
         info!("Closed session");
         debug!("Dropped");

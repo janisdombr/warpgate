@@ -39,9 +39,33 @@ impl<E> EventIntake<E> {
     pub async fn next(&mut self) -> Option<E> {
         if self.slot.is_none() {
             let slots = self.slots.clone();
+            // STALLCHAIN-INSTRUMENTATION: throwaway, strip before committing.
+            let sc_t0 = std::time::Instant::now();
+            let sc_slots = self.slots.clone();
+            tracing::info!(
+                t_ms = crate::stallchain_ms(),
+                permits = sc_slots.available_permits(),
+                "STALLCHAIN intake-wait-slot"
+            );
             tokio::select! {
-                event = self.control.recv() => return event,
-                slot = slots.acquire_owned() => self.slot = Some(slot.ok()?),
+                event = self.control.recv() => {
+                    tracing::info!(
+                        t_ms = crate::stallchain_ms(),
+                        waited_ms = sc_t0.elapsed().as_millis(),
+                        permits = sc_slots.available_permits(),
+                        "STALLCHAIN intake-control-while-waiting"
+                    );
+                    return event
+                },
+                slot = slots.acquire_owned() => {
+                    tracing::info!(
+                        t_ms = crate::stallchain_ms(),
+                        waited_ms = sc_t0.elapsed().as_millis(),
+                        permits = sc_slots.available_permits(),
+                        "STALLCHAIN intake-got-slot"
+                    );
+                    self.slot = Some(slot.ok()?)
+                },
             }
         }
         tokio::select! {

@@ -354,6 +354,8 @@ impl RemoteClient {
     }
 
     async fn set_disconnected(&mut self) {
+        // STALLCHAIN-INSTRUMENTATION: throwaway, strip before committing.
+        info!(t_ms = crate::stallchain_ms(), tx_capacity = self.tx.capacity(), "STALLCHAIN set_disconnected enter");
         self.session = None;
         for (id, op) in self.pending_ops.drain(..) {
             if matches!(op, ChannelOperation::OpenShell) {
@@ -364,15 +366,18 @@ impl RemoteClient {
             }
         }
         let _ = self.set_state(RCState::Disconnected).await;
+        info!(t_ms = crate::stallchain_ms(), tx_capacity = self.tx.capacity(), "STALLCHAIN set_disconnected sending RCEvent::Done");
         let _ = self.tx.send(RCEvent::Done).await;
+        info!(t_ms = crate::stallchain_ms(), "STALLCHAIN set_disconnected exit");
     }
 
     async fn set_state(&mut self, state: RCState) -> Result<(), SshClientError> {
         self.state = state.clone();
-        self.tx
-            .send(RCEvent::State(state))
-            .await
-            .map_err(|_| SshClientError::MpscError)?;
+        // STALLCHAIN-INSTRUMENTATION: throwaway, strip before committing.
+        info!(t_ms = crate::stallchain_ms(), ?state, tx_capacity = self.tx.capacity(), "STALLCHAIN set_state sending RCEvent::State");
+        let sc_res = self.tx.send(RCEvent::State(state)).await;
+        info!(t_ms = crate::stallchain_ms(), ok = sc_res.is_ok(), "STALLCHAIN set_state sent RCEvent::State");
+        sc_res.map_err(|_| SshClientError::MpscError)?;
         Ok(())
     }
 
@@ -482,6 +487,8 @@ impl RemoteClient {
                 debug!("Client handler event: {:?}", client_event);
                 match client_event {
                     ClientHandlerEvent::Disconnect => {
+                        // STALLCHAIN-INSTRUMENTATION: throwaway, strip before committing.
+                        info!(t_ms = crate::stallchain_ms(), "STALLCHAIN ClientHandlerEvent::Disconnect received by RemoteClient");
                         self._on_disconnect().await;
                     }
                     ClientHandlerEvent::ForwardedTcpIp(channel, params) => {
@@ -567,7 +574,9 @@ impl RemoteClient {
                 }
                 Err(e) => {
                     debug!("Connect error: {}", e);
+                    info!(t_ms = crate::stallchain_ms(), tx_capacity = self.tx.capacity(), "STALLCHAIN sending RCEvent::ConnectionError");
                     let _ = self.tx.send(RCEvent::ConnectionError(e)).await;
+                    info!(t_ms = crate::stallchain_ms(), "STALLCHAIN sent RCEvent::ConnectionError");
                     self.set_disconnected().await;
 
                     return Ok(true);

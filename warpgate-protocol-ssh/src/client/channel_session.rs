@@ -109,10 +109,18 @@ impl SessionChannel {
                         Some(russh::ChannelMsg::Data { data }) => {
                             let bytes: &[u8] = &data;
                             debug!("channel data: {bytes:?}");
+                            // STALLCHAIN-INSTRUMENTATION: throwaway, strip before committing.
+                            let sc_cap = self.events_tx.capacity();
+                            if sc_cap < 8 {
+                                info!(t_ms = crate::stallchain_ms(), capacity = sc_cap, len = bytes.len(), "STALLCHAIN channel_session about to send RCEvent::Output on a nearly-full queue");
+                            }
                             self.events_tx.send(RCEvent::Output(
                                 self.channel_id,
                                 Bytes::from(bytes.to_vec()),
                             )).await.map_err(|_| SshClientError::MpscError)?;
+                            if sc_cap < 8 {
+                                info!(t_ms = crate::stallchain_ms(), capacity = self.events_tx.capacity(), "STALLCHAIN channel_session sent RCEvent::Output");
+                            }
                         }
                         Some(russh::ChannelMsg::Close) => {
                             break;
@@ -149,6 +157,7 @@ impl SessionChannel {
                             warn!("unhandled channel message: {:?}", msg);
                         }
                         None => {
+                            info!(t_ms = crate::stallchain_ms(), channel=%self.channel_id, "STALLCHAIN channel_session: client_channel.wait() returned None");
                             break
                         },
                     }
@@ -167,7 +176,10 @@ impl SessionChannel {
     /// the close is discarded, and the client is never told its channel is over.
     async fn close_and_wait(&mut self) {
         if !self.closed {
+            // STALLCHAIN-INSTRUMENTATION: throwaway, strip before committing.
+            info!(t_ms = crate::stallchain_ms(), channel=%self.channel_id, capacity = self.events_tx.capacity(), "STALLCHAIN channel_session sending RCEvent::Close");
             let _ = self.events_tx.send(RCEvent::Close(self.channel_id)).await;
+            info!(t_ms = crate::stallchain_ms(), channel=%self.channel_id, "STALLCHAIN channel_session sent RCEvent::Close");
             self.closed = true;
         }
     }

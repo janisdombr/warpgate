@@ -20,6 +20,15 @@ use warpgate_tls::TlsCertificateAndPrivateKey;
 
 pub const PROTOCOL_NAME: Protocol = Protocol::Ssh;
 
+// STALLCHAIN-INSTRUMENTATION: throwaway, strip before committing.
+#[must_use]
+pub fn stallchain_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 #[derive(Clone)]
 pub struct SSHProtocolServer {
     services: Services,

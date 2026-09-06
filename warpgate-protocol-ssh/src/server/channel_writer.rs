@@ -52,29 +52,64 @@ pub struct ChannelWriter {
 impl ChannelWriter {
     pub fn new() -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<ChannelWriteOperation>();
+        // STALLCHAIN-INSTRUMENTATION: throwaway, strip before committing.
+        let data_slots = Arc::new(Semaphore::new(OUTBOUND_DATA_SLOTS));
+        let sc_slots = data_slots.clone();
+        let sc_weak = Arc::downgrade(&data_slots);
         tokio::spawn(async move {
+            let mut tick: u64 = 0;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tick += 1;
+                let Some(s) = sc_weak.upgrade() else { break };
+                tracing::info!(
+                    t_ms = crate::stallchain_ms(),
+                    tick,
+                    permits = s.available_permits(),
+                    "STALLCHAIN slots-tick"
+                );
+            }
+        });
+        tokio::spawn(async move {
+            let mut seq: u64 = 0;
             while let Some(operation) = rx.recv().await {
+                seq += 1;
                 match operation {
                     ChannelWriteOperation::Data(handle, channel, data, _slot) => {
+                        let len = data.len();
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "Data", len, held_slot = _slot.is_some(), permits = sc_slots.available_permits(), "STALLCHAIN writer-enter");
                         let _ = handle.data(channel, data).await;
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "Data", permits = sc_slots.available_permits(), "STALLCHAIN writer-exit");
                     }
                     ChannelWriteOperation::ExtendedData(handle, channel, ext, data, _slot) => {
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "ExtendedData", held_slot = _slot.is_some(), permits = sc_slots.available_permits(), "STALLCHAIN writer-enter");
                         let _ = handle.extended_data(channel, ext, data).await;
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "ExtendedData", permits = sc_slots.available_permits(), "STALLCHAIN writer-exit");
                     }
                     ChannelWriteOperation::Eof(handle, channel) => {
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "Eof", permits = sc_slots.available_permits(), "STALLCHAIN writer-enter");
                         let _ = handle.eof(channel).await;
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "Eof", permits = sc_slots.available_permits(), "STALLCHAIN writer-exit");
                     }
                     ChannelWriteOperation::Close(handle, channel) => {
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "Close", permits = sc_slots.available_permits(), "STALLCHAIN writer-enter");
                         let _ = handle.close(channel).await;
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "Close", permits = sc_slots.available_permits(), "STALLCHAIN writer-exit");
                     }
                     ChannelWriteOperation::Success(handle, channel) => {
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "Success", "STALLCHAIN writer-enter");
                         let _ = handle.channel_success(channel).await;
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "Success", "STALLCHAIN writer-exit");
                     }
                     ChannelWriteOperation::Failure(handle, channel) => {
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "Failure", "STALLCHAIN writer-enter");
                         let _ = handle.channel_failure(channel).await;
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "Failure", "STALLCHAIN writer-exit");
                     }
                     ChannelWriteOperation::ExitStatus(handle, channel, status) => {
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "ExitStatus", "STALLCHAIN writer-enter");
                         let _ = handle.exit_status_request(channel, status).await;
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "ExitStatus", "STALLCHAIN writer-exit");
                     }
                     ChannelWriteOperation::ExitSignal(
                         handle,
@@ -84,20 +119,22 @@ impl ChannelWriter {
                         message,
                         lang_tag,
                     ) => {
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "ExitSignal", "STALLCHAIN writer-enter");
                         let _ = handle
                             .exit_signal_request(channel, signal, core_dumped, message, lang_tag)
                             .await;
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "ExitSignal", "STALLCHAIN writer-exit");
                     }
                     ChannelWriteOperation::Flush(reply) => {
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "Flush", "STALLCHAIN writer-enter");
                         let _ = reply.send(());
+                        tracing::info!(t_ms = crate::stallchain_ms(), seq, op = "Flush", "STALLCHAIN writer-exit");
                     }
                 }
             }
+            tracing::info!(t_ms = crate::stallchain_ms(), "STALLCHAIN writer-task-ended");
         });
-        Self {
-            tx,
-            data_slots: Arc::new(Semaphore::new(OUTBOUND_DATA_SLOTS)),
-        }
+        Self { tx, data_slots }
     }
 
     /// The outbound data budget, to be claimed before accepting target-side
