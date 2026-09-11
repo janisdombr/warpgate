@@ -366,21 +366,42 @@ def _netstat_rows():
     return _rows_linux(raw) if _IS_LINUX else _rows_macos(raw)
 
 
-def _conn_rows(wg_port: int, client_port: int):
-    """The two ends of one loopback connection: (gateway side, client side).
+def _loopback_port(addr: str):
+    """The port of a loopback address, in any spelling this machine uses.
 
-    The separator differs: macOS writes `127.0.0.1.2222`, Linux
-    `127.0.0.1:2222`. Getting this wrong matches nothing and reads as a
-    connection that does not exist, so it is derived rather than typed twice.
+    macOS writes `127.0.0.1.2222`. Linux writes `127.0.0.1:2222` for a socket
+    opened over IPv4 and `[::ffff:127.0.0.1]:2222` for the same connection seen
+    from a dual-stack listener -- which is what Warpgate binds, so on Linux the
+    two ends of one loopback connection are spelled differently from each
+    other. Matching the client's spelling against the gateway found the client
+    and not the gateway, and an `and` over the two then read as "the client
+    never stopped reading" while its receive queue sat at 96% of the buffer and
+    the gateway held 1.9 MB it could not send.
     """
-    sep = ":" if _IS_LINUX else "."
-    gw_local = f"127.0.0.1{sep}{wg_port}"
-    cl_local = f"127.0.0.1{sep}{client_port}"
+    if addr.startswith("["):
+        host, _, port = addr.rpartition("]:")
+        host = host[1:]
+    elif _IS_LINUX:
+        host, _, port = addr.rpartition(":")
+    else:
+        host, _, port = addr.rpartition(".")
+    if host not in ("127.0.0.1", "::ffff:127.0.0.1", "::1"):
+        return None
+    return port if port.isdigit() else None
+
+
+def _conn_rows(wg_port: int, client_port: int):
+    """The two ends of one loopback connection: (gateway side, client side)."""
+    wg, cl = str(wg_port), str(client_port)
     gateway = client = None
     for row in _netstat_rows():
-        if row["local"] == gw_local and row["foreign"] == cl_local:
+        local = _loopback_port(row["local"])
+        foreign = _loopback_port(row["foreign"])
+        if local is None or foreign is None:
+            continue
+        if local == wg and foreign == cl:
             gateway = row
-        elif row["local"] == cl_local and row["foreign"] == gw_local:
+        elif local == cl and foreign == wg:
             client = row
     return gateway, client
 

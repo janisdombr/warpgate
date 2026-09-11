@@ -114,8 +114,15 @@ jobs:
           print("command:", " ".join(_SOCKET_CMD))
           assert _IS_LINUX, "this job exists to take the Linux number"
 
-          srv = socket.socket()
-          srv.bind(("127.0.0.1", 0))
+          # Dual-stack, the way Warpgate binds its listener -- not AF_INET.
+          # The first probe used a plain IPv4 pair on both ends and passed,
+          # while the real run found the client and not the gateway: Linux
+          # spells the accepted end of a v4 connection on a v6 listener
+          # `[::ffff:127.0.0.1]`. A probe that cannot reach the shape under
+          # test is a probe that certifies the wrong thing.
+          srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+          srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+          srv.bind(("::", 0))
           srv.listen(1)
           port = srv.getsockname()[1]
           # Kept, not discarded: an accepted socket nobody holds is collected
