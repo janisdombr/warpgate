@@ -60,52 +60,16 @@ jobs:
           sudo apt-get install -y openssh-client expect lsof iproute2
           cargo install --locked just@1.4.0
 
-      # Before anything is built, prove the instrument reads this kernel. The
-      # harness's own guard tells a parser that matched nothing apart from a
-      # client that would not stall, but only after an iteration has burned
-      # BACKLOG_WAIT_S. Failing here instead costs seconds and cannot be
-      # mistaken for a measurement.
-      - name: Prove the socket parser reads a live connection
-        working-directory: tests
+      # Seconds, no imports: does this runner's `ss` emit the three things
+      # the parser is built on at all? A kernel or an iproute2 that does not
+      # is worth learning about before ten minutes of build.
+      - name: Does this kernel report what the parser reads
         run: |
-          python3 - <<'PY'
-          import importlib.util, socket, sys, threading, pathlib
-          spec = importlib.util.spec_from_file_location(
-              "stall", pathlib.Path("test_stall_unread_client_release.py")
-          )
-          m = importlib.util.module_from_spec(spec)
-          sys.modules["stall"] = m
-          spec.loader.exec_module(m)
-
-          print("platform:", sys.platform, "-> linux:", m._IS_LINUX)
-          print("command:", " ".join(m._SOCKET_CMD))
-          assert m._IS_LINUX, "this job exists to take the Linux number"
-
-          srv = socket.socket()
-          srv.bind(("127.0.0.1", 0))
-          srv.listen(1)
-          port = srv.getsockname()[1]
-          accepted = []
-          threading.Thread(target=lambda: accepted.append(srv.accept()), daemon=True).start()
-          cli = socket.create_connection(("127.0.0.1", port))
-          cli.sendall(b"x" * 1024)
-          import time; time.sleep(0.5)
-
-          gw, cl = m._conn_rows(port, cli.getsockname()[1])
-          raw = m._socket_dump()
-          pathlib.Path("parser-probe.txt").write_text(raw)
-          assert gw is not None, f"no server-side row for 127.0.0.1:{port}\n{raw[:3000]}"
-          assert cl is not None, f"no client-side row\n{raw[:3000]}"
-          # The three fields every assertion downstream is built on. A parser
-          # that found the line but not these would read as a socket that
-          # never filled.
-          assert gw["rhiwat"] > 0, f"no rb in skmem: {gw['line']}"
-          assert cl["rhiwat"] > 0, f"no rb in skmem: {cl['line']}"
-          assert cl["rxbytes"] >= 1024, f"bytes_received not parsed: {cl['line']}"
-          print("server:", gw["line"])
-          print("client:", cl["line"])
-          print("parser reads this kernel: recvq/sendq, rb/tb and byte counters all present")
-          PY
+          set -e
+          ss -tanmi > /tmp/ss-probe.txt || { echo "ss is not usable here"; exit 1; }
+          grep -q 'skmem:(' /tmp/ss-probe.txt || { echo "no skmem in ss -m output"; head -40 /tmp/ss-probe.txt; exit 1; }
+          grep -qE 'bytes_(sent|received):' /tmp/ss-probe.txt || { echo "no byte counters in ss -i output"; head -40 /tmp/ss-probe.txt; exit 1; }
+          echo "ss reports skmem and byte counters; the real probe runs once deps are installed"
 
       - name: Build UI
         run: |
@@ -129,6 +93,58 @@ jobs:
           # poetry refuses to install it as one. Not `|| true`, which would
           # also swallow a dependency that genuinely failed to resolve.
           poetry install --no-root
+
+      # The real one. `tests` is a package and the harness imports its
+      # siblings, so it cannot be loaded as a loose file -- which is what the
+      # first attempt at this step got wrong. Run from the repo root, through
+      # the venv that now has the deps, against a loopback connection this
+      # step fills itself. Still ahead of the measurement, which is the part
+      # that costs iterations x OBSERVE_S.
+      - name: Prove the socket parser reads a live connection
+        working-directory: tests
+        run: |
+          poetry run python - <<'PY'
+          import pathlib, socket, sys, threading, time
+          sys.path.insert(0, str(pathlib.Path.cwd().parent))
+          from tests.test_stall_unread_client_release import (
+              _IS_LINUX, _SOCKET_CMD, _conn_rows, _socket_dump,
+          )
+
+          print("platform:", sys.platform, "-> linux:", _IS_LINUX)
+          print("command:", " ".join(_SOCKET_CMD))
+          assert _IS_LINUX, "this job exists to take the Linux number"
+
+          srv = socket.socket()
+          srv.bind(("127.0.0.1", 0))
+          srv.listen(1)
+          port = srv.getsockname()[1]
+          # Kept, not discarded: an accepted socket nobody holds is collected
+          # and closed, and the connection this step is about stops existing
+          # before anything can read it out of the kernel.
+          accepted = []
+          threading.Thread(
+              target=lambda: accepted.append(srv.accept()), daemon=True
+          ).start()
+          cli = socket.create_connection(("127.0.0.1", port))
+          cli.sendall(b"x" * 4096)
+          time.sleep(0.5)
+
+          raw = _socket_dump()
+          pathlib.Path("parser-probe.txt").write_text(raw)
+          gw, cl = _conn_rows(port, cli.getsockname()[1])
+          assert gw is not None, f"no row for the server side of 127.0.0.1:{port}\n{raw[:3000]}"
+          assert cl is not None, f"no row for the client side\n{raw[:3000]}"
+          # The three fields every downstream assertion is built on. Finding
+          # the line but not these would read as a socket that never filled.
+          assert gw["rhiwat"] > 0, f"no rb in skmem: {gw['line']}"
+          assert cl["shiwat"] > 0, f"no tb in skmem: {cl['line']}"
+          assert gw["rxbytes"] >= 4096 or cl["txbytes"] >= 4096, (
+              f"byte counters not parsed:\n  server {gw['line']}\n  client {cl['line']}"
+          )
+          print("server:", gw["line"])
+          print("client:", cl["line"])
+          print("the parser reads this kernel: recvq/sendq, rb/tb and byte counters all present")
+          PY
 
       - name: Measure
         working-directory: tests
