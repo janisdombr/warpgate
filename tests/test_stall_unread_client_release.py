@@ -236,6 +236,41 @@ _IS_LINUX = sys.platform.startswith("linux")
 _SOCKET_CMD = ["ss", "-tanmi"] if _IS_LINUX else ["netstat", "-anv", "-p", "tcp"]
 
 
+def _wait_sshd_banner(port: int, timeout: float = 90.0):
+    """Wait for the container's sshd to answer, not merely for its port to
+    accept.
+
+    Not `wait_port`: it treats one empty read as fatal rather than as "not yet",
+    and `_wait_timeout` cannot tell a wait thread that finished from one that
+    died -- `t.is_alive()` is False either way, so the caller is told the port
+    is up. On a Linux runner the published container port accepts before sshd
+    is behind it, which is how an iteration here got as far as reporting with
+    nothing measured. macOS's Docker proxy does not accept until the container
+    listens, so this never showed up locally."""
+    deadline = time.monotonic() + timeout
+    last = "never connected"
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("localhost", port), timeout=5) as sock:
+                sock.settimeout(5)
+                banner = sock.recv(100)
+            if banner.startswith(b"SSH-"):
+                return
+            last = f"answered {banner[:40]!r}, not an SSH banner"
+        except OSError as error:
+            last = str(error)
+        time.sleep(0.5)
+    raise AssertionError(f"sshd on {port} never answered in {timeout:.0f}s: {last}")
+
+
+def _secs(value) -> str:
+    """`None` is a real outcome here -- an iteration that never reached the
+    observation phase has no seconds to report -- so it has to survive being
+    printed. Formatting it as a float turned the abort that caused it into a
+    TypeError, which then threw away the error it was about to name."""
+    return "None" if value is None else f"{value:.1f}"
+
+
 def _socket_dump() -> str:
     try:
         r = subprocess.run(_SOCKET_CMD, capture_output=True, timeout=15)
@@ -779,7 +814,7 @@ def test_stalled_client_release_after_target_death(
     sshd_port = processes.start_ssh_server(
         trusted_keys=[wg_c_ed25519_pubkey.read_text()]
     )
-    wait_port(sshd_port)
+    _wait_sshd_banner(sshd_port)
 
     results = []
     for i in range(1, ITERATIONS + 1):
@@ -792,7 +827,7 @@ def test_stalled_client_release_after_target_death(
         results.append(record)
         print(
             f"RESULT shard={SHARD_ID} iter={i} stalled={record['stalled']} "
-            f"release_s={record['release_s']} observed_s={record['observed_s']:.1f} "
+            f"release_s={record['release_s']} observed_s={_secs(record['observed_s'])} "
             f"rc={record['client_returncode']} "
             f"markers={record.get('log_markers_s')} error={record.get('error')}",
             flush=True,
@@ -838,7 +873,7 @@ def test_control_reading_client(processes: ProcessManager, ctx, wg_c_ed25519_pub
     sshd_port = processes.start_ssh_server(
         trusted_keys=[wg_c_ed25519_pubkey.read_text()]
     )
-    wait_port(sshd_port)
+    _wait_sshd_banner(sshd_port)
     record = _run_iteration(
         processes, ctx, wg_c_ed25519_pubkey, sshd_port, 900, False, artifacts
     )
@@ -846,7 +881,7 @@ def test_control_reading_client(processes: ProcessManager, ctx, wg_c_ed25519_pub
     (artifacts / "meta.json").write_text(json.dumps(record, indent=2))
     print(
         f"RESULT shard={SHARD_ID} CONTROL release_s={record['release_s']} "
-        f"observed_s={record['observed_s']:.1f} rc={record['client_returncode']} "
+        f"observed_s={_secs(record['observed_s'])} rc={record['client_returncode']} "
         f"markers={record.get('log_markers_s')} error={record.get('error')}",
         flush=True,
     )
