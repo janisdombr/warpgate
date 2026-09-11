@@ -1,0 +1,166 @@
+name: Stall hunt
+
+# Fork-only. Not part of PR #2549.
+#
+# The question: when a client stops reading until its SSH channel window is
+# empty and its target then dies, how long does the gateway hold the client's
+# TCP connection? Measured on macOS it is never -- still held at 240s, with a
+# reading client released in 3s. Warpgate runs on Linux, and the mechanism
+# runs through the kernel's handling of a write to a zero-window peer, which
+# is not the same code on the two platforms. So the number that decides what
+# PR #2549 may claim is the Linux one, and this is where it is taken.
+#
+# `tests/test_stall_unread_client_release.py` is a measuring instrument, not a
+# regression test. It refuses to infer that the client stalled, that the
+# gateway let go, or that its threshold means anything -- and this workflow
+# adds the fourth refusal that only a port needs: it will not report a number
+# until the socket parser has been shown to read a live connection on this
+# runner.
+
+on:
+  push:
+    branches: [ "tooling/stall-hunt" ]
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "Stalled iterations to measure"
+        default: "3"
+      inactivity:
+        description: "ssh.inactivity_timeout for the gateway under test"
+        default: "15s"
+      observe:
+        description: "Seconds to watch for a release after the target dies"
+        default: "240"
+      target_kill:
+        description: "relay (instant RST) or docker (real container kill)"
+        default: "relay"
+
+permissions:
+  contents: read
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: "test"
+
+      - name: Install build deps
+        run: |
+          sudo apt-get install -y openssh-client expect lsof iproute2
+          cargo install --locked just@1.4.0
+
+      # Before anything is built, prove the instrument reads this kernel. The
+      # harness's own guard tells a parser that matched nothing apart from a
+      # client that would not stall, but only after an iteration has burned
+      # BACKLOG_WAIT_S. Failing here instead costs seconds and cannot be
+      # mistaken for a measurement.
+      - name: Prove the socket parser reads a live connection
+        working-directory: tests
+        run: |
+          python3 - <<'PY'
+          import importlib.util, socket, sys, threading, pathlib
+          spec = importlib.util.spec_from_file_location(
+              "stall", pathlib.Path("test_stall_unread_client_release.py")
+          )
+          m = importlib.util.module_from_spec(spec)
+          sys.modules["stall"] = m
+          spec.loader.exec_module(m)
+
+          print("platform:", sys.platform, "-> linux:", m._IS_LINUX)
+          print("command:", " ".join(m._SOCKET_CMD))
+          assert m._IS_LINUX, "this job exists to take the Linux number"
+
+          srv = socket.socket()
+          srv.bind(("127.0.0.1", 0))
+          srv.listen(1)
+          port = srv.getsockname()[1]
+          accepted = []
+          threading.Thread(target=lambda: accepted.append(srv.accept()), daemon=True).start()
+          cli = socket.create_connection(("127.0.0.1", port))
+          cli.sendall(b"x" * 1024)
+          import time; time.sleep(0.5)
+
+          gw, cl = m._conn_rows(port, cli.getsockname()[1])
+          raw = m._socket_dump()
+          pathlib.Path("parser-probe.txt").write_text(raw)
+          assert gw is not None, f"no server-side row for 127.0.0.1:{port}\n{raw[:3000]}"
+          assert cl is not None, f"no client-side row\n{raw[:3000]}"
+          # The three fields every assertion downstream is built on. A parser
+          # that found the line but not these would read as a socket that
+          # never filled.
+          assert gw["rhiwat"] > 0, f"no rb in skmem: {gw['line']}"
+          assert cl["rhiwat"] > 0, f"no rb in skmem: {cl['line']}"
+          assert cl["rxbytes"] >= 1024, f"bytes_received not parsed: {cl['line']}"
+          print("server:", gw["line"])
+          print("client:", cl["line"])
+          print("parser reads this kernel: recvq/sendq, rb/tb and byte counters all present")
+          PY
+
+      - name: Build UI
+        run: |
+          just npm ci
+          just openapi
+          just npm run openapi:tests-sdk
+          just npm run build
+
+      - name: Build the gateway
+        run: cargo build --bin warpgate --all-features
+
+      - name: Build images
+        working-directory: tests
+        run: make all
+
+      - name: Install deps
+        working-directory: tests
+        run: |
+          pip3 install poetry==1.8.3
+          # --no-root: `tests` is a dependency set, not a package, and newer
+          # poetry refuses to install it as one. Not `|| true`, which would
+          # also swallow a dependency that genuinely failed to resolve.
+          poetry install --no-root
+
+      - name: Measure
+        working-directory: tests
+        env:
+          WG_INACTIVITY: ${{ github.event.inputs.inactivity || '15s' }}
+          ITERATIONS: ${{ github.event.inputs.iterations || '3' }}
+          OBSERVE_S: ${{ github.event.inputs.observe || '240' }}
+          THRESHOLD_S: ${{ github.event.inputs.observe || '240' }}
+          TARGET_KILL: ${{ github.event.inputs.target_kill || 'relay' }}
+          SHARD_ID: linux
+          TIMEOUT: "120"
+        run: |
+          # Not `|| exit 1`: a red assertion here is the finding, and the
+          # artefacts below are what the finding is read from.
+          poetry run pytest test_stall_unread_client_release.py \
+            -q -s --tb=short -p no:randomly || echo "STALL_HUNT_RED=1" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: stall-artifacts-linux
+          path: |
+            tests/stall-artifacts/**
+            tests/parser-probe.txt
+          if-no-files-found: warn
+
+      - name: Say what happened
+        if: always()
+        run: |
+          if [ "${STALL_HUNT_RED:-0}" = "1" ]; then
+            echo "The gateway did not release a stalled client within the threshold on Linux." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "The gateway released every stalled client within the threshold on Linux." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "Raw socket output and per-iteration evidence are in the stall-artifacts-linux artifact." >> "$GITHUB_STEP_SUMMARY"
