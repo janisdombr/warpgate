@@ -27,11 +27,23 @@ def alloc_port():
 
 
 def _wait_timeout(fn, msg, timeout=60):
-    t = threading.Thread(target=fn, daemon=True)
+    # A thread that died from an exception is not alive either, so testing
+    # `is_alive()` alone reported every failed wait as a successful one.
+    failure = []
+
+    def run():
+        try:
+            fn()
+        except BaseException as e:  # noqa: BLE001 - re-raised below
+            failure.append(e)
+
+    t = threading.Thread(target=run, daemon=True)
     t.start()
     t.join(timeout=timeout)
     if t.is_alive():
         raise Exception(msg)
+    if failure:
+        raise failure[0]
 
 
 def wait_port(port, recv=True, timeout=60, for_process: subprocess.Popen = None, connect_timeout=5, read_timeout=5):
@@ -52,9 +64,14 @@ def wait_port(port, recv=True, timeout=60, for_process: subprocess.Popen = None,
                 if for_process:
                     try:
                         for_process.wait(timeout=0.1)
-                        raise Exception("Process exited while waiting for port")
                     except subprocess.TimeoutExpired:
                         continue
+                    # Outside the `try`: raised inside it, this was swallowed
+                    # by the `except` above and never reached the caller.
+                    raise Exception(
+                        f"Process exited with code {for_process.returncode} "
+                        f"while waiting for port {port}"
+                    )
                 else:
                     time.sleep(0.1)
 
@@ -77,11 +94,7 @@ def wait_mysql_port(port):
                 time.sleep(1)
                 continue
 
-    t = threading.Thread(target=wait, daemon=True)
-    t.start()
-    t.join(timeout=60)
-    if t.is_alive():
-        raise Exception(f"Port {port} is not up")
+    _wait_timeout(wait, f"Port {port} is not up")
 
 
 def open_wg_sqlite_db(config_path):
