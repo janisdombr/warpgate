@@ -440,8 +440,6 @@ impl ListApi {
                         },
                     )))
                 }
-                // This endpoint exists to tell an admin what is wrong, so
-                // it opts out of the generic rendering.
                 Err(e) => Ok(TestLdapServerConnectionResponse::Ok(Json(
                     TestLdapServerResponse {
                         success: false,

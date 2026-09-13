@@ -511,10 +511,14 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
 mod tests {
     use super::{StatusCode, gateway_redirect, host_is_subdomain_of_or_equal};
 
+    const BROWSER_ACCEPT: &str = "text/html,application/xhtml+xml,*/*;q=0.8";
+
     #[test]
     fn gateway_redirect_navigation_redirects_to_login() {
         for mode in [None, Some("navigate")] {
-            let mut req = poem::Request::builder().uri_str("/api/data");
+            let mut req = poem::Request::builder()
+                .uri_str("/api/data")
+                .header("accept", BROWSER_ACCEPT);
             if let Some(mode) = mode {
                 req = req.header("sec-fetch-mode", mode);
             }
@@ -532,13 +536,28 @@ mod tests {
     #[test]
     fn gateway_redirect_fetch_gets_401() {
         // https://github.com/warp-tech/warpgate/issues/1989
-        for mode in ["cors", "same-origin", "no-cors"] {
-            let req = poem::Request::builder()
-                .uri_str("/api/data")
-                .header("sec-fetch-mode", mode)
-                .finish();
-            let resp = gateway_redirect(&req);
-            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let cases = [
+            (None, None),
+            (Some("*/*"), None),
+            (Some("application/json"), Some("cors")),
+            (Some(BROWSER_ACCEPT), Some("cors")),
+            (Some(BROWSER_ACCEPT), Some("same-origin")),
+            (Some(BROWSER_ACCEPT), Some("no-cors")),
+        ];
+        for (accept, mode) in cases {
+            let mut req = poem::Request::builder().uri_str("/api/data");
+            if let Some(accept) = accept {
+                req = req.header("accept", accept);
+            }
+            if let Some(mode) = mode {
+                req = req.header("sec-fetch-mode", mode);
+            }
+            let resp = gateway_redirect(&req.finish());
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{accept:?} {mode:?}"
+            );
         }
     }
 

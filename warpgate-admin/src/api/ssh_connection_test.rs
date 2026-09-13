@@ -86,9 +86,8 @@ impl Api {
             anyhow::Ok(key)
         };
 
-        // Matched manually rather than via `?`: this endpoint exists to
-        // tell an admin what is wrong, so it opts out of the generic
-        // rendering.
+        // Result is matched manually since we need to manually format
+        // the error message with :# to included the nested errors here
         match fut.await {
             Ok(key) => Ok(CheckSshHostKeyResponse::Ok(Json(
                 CheckSshHostKeyResponseBody {

@@ -1,4 +1,4 @@
-//! The last thing between a server-side failure and the client that caused it.
+//! Client-facing rendering of request errors.
 
 use std::sync::Arc;
 
@@ -9,29 +9,25 @@ use warpgate_common::{UserFacingReason, WarpgateError};
 
 use crate::ext::is_navigation_request;
 
-fn client_facing_reason(error: &poem::Error) -> String {
+pub fn render_error(error: poem::Error, as_document: bool) -> Response {
     let status = error.status();
     let reason = match error.downcast_ref::<WarpgateError>() {
         Some(error) => error.user_facing_reason(),
         None if status.is_server_error() => status.canonical_reason().unwrap_or("Error").to_owned(),
-        None => error.to_string(),
+        None => return error.into_response(),
     };
-    if !status.is_server_error() {
-        return reason;
-    }
-    let correlation_id = Uuid::new_v4();
-    tracing::error!(
-        correlation_id = %correlation_id,
-        // {:#} for single line format
-        error = %format!("{error:#}"),
-        "Request failed with an internal error"
-    );
-    format!("{reason} (reference: {correlation_id})")
-}
-
-pub fn render_error(error: &poem::Error, as_document: bool) -> Response {
-    let status = error.status();
-    let message = client_facing_reason(error);
+    let message = if status.is_server_error() {
+        let correlation_id = Uuid::new_v4();
+        tracing::error!(
+            correlation_id = %correlation_id,
+            // {:#} for single line format
+            error = %format!("{error:#}"),
+            "Request failed with an internal error"
+        );
+        format!("{reason} (reference: {correlation_id})")
+    } else {
+        reason
+    };
     if !as_document {
         return message.with_status(status).into_response();
     }
@@ -77,32 +73,18 @@ pub async fn render_errors<E: Endpoint + 'static>(
     let as_document = is_navigation_request(&req);
     Ok(match ep.call(req).await {
         Ok(response) => response.into_response(),
-        Err(error) => render_error(&error, as_document),
-    })
-}
-
-/// [`render_errors`] for a listener no browser ever reaches.
-///
-/// `is_navigation_request` answers "no `Sec-Fetch-Mode`" with "navigation",
-/// which is right for a gateway that still has to serve old browsers and
-/// wrong for an API a `kubectl` speaks to: every failing request would be
-/// answered with a styled page.
-pub async fn render_errors_plain<E: Endpoint + 'static>(
-    ep: Arc<E>,
-    req: Request,
-) -> poem::Result<Response> {
-    Ok(match ep.call(req).await {
-        Ok(response) => response.into_response(),
-        Err(error) => render_error(&error, false),
+        Err(error) => render_error(error, as_document),
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use poem::error::ResponseError;
     use poem::http::StatusCode;
+    use poem::{Endpoint, EndpointExt, Request, Response, handler};
     use warpgate_common::WarpgateError;
 
-    use super::{render_error, render_errors, render_errors_plain};
+    use super::{render_error, render_errors};
 
     const LEAK: &str = "no such table: credentials";
 
@@ -123,7 +105,7 @@ mod tests {
         // carried the text and would prove nothing about the boundary.
         assert!(body_of(laundered().into_response()).await.contains(LEAK));
 
-        let body = body_of(render_error(&laundered(), false)).await;
+        let body = body_of(render_error(laundered(), false)).await;
         assert!(
             !body.contains(LEAK),
             "the raw error reached the client: {body}"
@@ -137,7 +119,7 @@ mod tests {
     #[tokio::test]
     async fn a_warpgate_error_renders_its_canonical_reason() {
         let wrapped: poem::Error = WarpgateError::Other(LEAK.into()).into();
-        let body = body_of(render_error(&wrapped, false)).await;
+        let body = body_of(render_error(wrapped, false)).await;
         assert!(
             !body.contains(LEAK),
             "the raw error reached the client: {body}"
@@ -145,7 +127,7 @@ mod tests {
         assert!(body.starts_with("Internal Server Error (reference: "));
 
         let kept: poem::Error = WarpgateError::UserNotFound("alice".into()).into();
-        let response = render_error(&kept, false);
+        let response = render_error(kept, false);
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(body_of(response).await, "user alice not found");
     }
@@ -155,21 +137,49 @@ mod tests {
     #[tokio::test]
     async fn a_client_error_keeps_its_message() {
         let refused = poem::Error::from_string("field `name` is required", StatusCode::BAD_REQUEST);
-        let body = body_of(render_error(&refused, false)).await;
+        let body = body_of(render_error(refused, false)).await;
         assert_eq!(body, "field `name` is required");
+    }
+
+    /// The MFA setup gate is a 403 that redirects navigations and carries a
+    /// header the SPA keys off; both live in its `as_response`.
+    #[tokio::test]
+    async fn a_foreign_client_error_keeps_its_own_response() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("setup required")]
+        struct Gate;
+
+        impl ResponseError for Gate {
+            fn status(&self) -> StatusCode {
+                StatusCode::FORBIDDEN
+            }
+
+            fn as_response(&self) -> Response {
+                Response::builder()
+                    .status(StatusCode::TEMPORARY_REDIRECT)
+                    .header("x-marker", "1")
+                    .header("location", "/setup")
+                    .finish()
+            }
+        }
+
+        let response = render_error(Gate.into(), true);
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(response.header("x-marker"), Some("1"));
+        assert_eq!(response.header("location"), Some("/setup"));
     }
 
     #[tokio::test]
     async fn each_failure_gets_its_own_reference() {
-        let first = body_of(render_error(&anyhow::anyhow!("{LEAK}").into(), false)).await;
-        let second = body_of(render_error(&anyhow::anyhow!("{LEAK}").into(), false)).await;
+        let first = body_of(render_error(anyhow::anyhow!("{LEAK}").into(), false)).await;
+        let second = body_of(render_error(anyhow::anyhow!("{LEAK}").into(), false)).await;
         assert_ne!(first, second, "the reference is not per-failure: {first}");
     }
 
     #[tokio::test]
     async fn the_status_survives_the_flattening() {
         let gateway: poem::Error = poem::error::BadGateway(std::io::Error::other(LEAK));
-        let response = render_error(&gateway, false);
+        let response = render_error(gateway, false);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert!(
             body_of(response)
@@ -182,7 +192,7 @@ mod tests {
     async fn a_document_request_gets_a_page_with_the_message_escaped() {
         let refused: poem::Error =
             WarpgateError::UserNotFound("<script>alert(1)</script>".into()).into();
-        let response = render_error(&refused, true);
+        let response = render_error(refused, true);
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(response.content_type(), Some("text/html; charset=utf-8"));
         let body = body_of(response).await;
@@ -194,43 +204,24 @@ mod tests {
         assert!(body.contains("&lt;script&gt;"));
     }
 
-    /// The `kubectl` case. A client that sends no `Sec-Fetch-Mode` is read as
-    /// a navigation by the shared classifier, so the layer the gateway uses
-    /// would answer a machine with a styled page. Asserted through the layer
-    /// rather than through `render_error(_, false)`, because what is at stake
-    /// is which of the two the Kubernetes listener is wired to.
+    /// Only a client that asks for HTML gets a page; kubectl, curl and the
+    /// SPA's `fetch` all send no `Accept: text/html`.
     #[tokio::test]
-    async fn a_header_less_client_is_not_handed_a_page() {
-        use poem::{Endpoint, EndpointExt, handler};
-
+    async fn only_an_html_accepting_client_gets_a_page() {
         #[handler]
         fn always_fails() -> poem::Result<&'static str> {
             Err(WarpgateError::UserNotFound("someone".into()).into())
         }
+        let app = always_fails.around(render_errors);
 
-        // First the control: the gateway's own layer does hand this exact
-        // request a document, or the assertion below would hold for a request
-        // that was never classified as a navigation at all.
-        let as_document = always_fails
-            .around(render_errors)
-            .call(poem::Request::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            as_document.content_type(),
-            Some("text/html; charset=utf-8"),
-            "the premise is gone: a header-less request is no longer a navigation"
-        );
-
-        let plain = always_fails
-            .around(render_errors_plain)
-            .call(poem::Request::default())
-            .await
-            .unwrap();
-        assert_eq!(plain.status(), StatusCode::UNAUTHORIZED);
+        let plain = app.call(Request::default()).await.unwrap();
         assert_ne!(plain.content_type(), Some("text/html; charset=utf-8"));
-        let body = body_of(plain).await;
-        assert!(!body.contains("<!DOCTYPE html>"), "got a page: {body}");
-        assert!(body.contains("someone"), "the message was lost: {body}");
+        assert_eq!(body_of(plain).await, "user someone not found");
+
+        let browser = Request::builder()
+            .header("accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+            .finish();
+        let page = app.call(browser).await.unwrap();
+        assert_eq!(page.content_type(), Some("text/html; charset=utf-8"));
     }
 }
