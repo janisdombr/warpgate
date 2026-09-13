@@ -94,10 +94,13 @@ from .conftest import ProcessManager
 from .util import alloc_port, wait_port
 
 ITERATIONS = int(os.getenv("ITERATIONS", "3"))
-# How long to watch for the gateway to let go before giving up on it. Kept
-# below russh's own `inactivity_timeout + 10s` by default so a run does not
-# silently turn into a 5-minute wait; raise it to find out what the gateway
-# does eventually rather than whether it does anything soon.
+# How long to watch for the gateway to let go before giving up on it.
+# russh's own timer is `ssh.inactivity_timeout + admin_approval_timeout + 10s`
+# (`server/mod.rs`), which is 625s on defaults with a 15s inactivity timeout --
+# an earlier version of this comment left the approval term out, and that is
+# why the runs it sized sat below the timer and could not tell "the gateway
+# never lets go" from "russh would have, later". Set WG_APPROVAL_TIMEOUT_S to
+# bring the timer down to where a short run can see past it.
 OBSERVE_S = float(os.getenv("OBSERVE_S", "60"))
 # The discriminating line. A healthy teardown is under a second (see
 # `test_control_reading_client`); russh's inactivity timeout is 5m10s with
@@ -114,12 +117,18 @@ STALL_QUIET_SAMPLES = int(os.getenv("STALL_QUIET_SAMPLES", "4"))
 # After SIGCONT, how long to give the client to exit on its own.
 CONT_WAIT_S = float(os.getenv("CONT_WAIT_S", "60"))
 TARGET_KILL = os.getenv("TARGET_KILL", "relay")
-# Overrides `ssh.inactivity_timeout`. russh gets that plus 10s
-# (`server/mod.rs`), and its inactivity arm is the one arm of the run loop's
-# `select!` that pending data does not disable — so a short value here turns
-# "does the gateway ever let go, and because of what" into a question a
-# 60-second run can answer.
+# Overrides `ssh.inactivity_timeout`. Its inactivity arm is the one arm of
+# the run loop's `select!` that pending data does not disable — so a short
+# value here turns "does the gateway ever let go, and because of what" into a
+# question a short run can answer.
 WG_INACTIVITY = os.getenv("WG_INACTIVITY", "")
+# Overrides the `admin_approval_timeout_seconds` parameter, the second term of
+# russh's timer. It lives in the database and the russh config is built once at
+# startup, so it has to be set before the measured node boots -- hence the seed
+# node in `_seed_approval_timeout`. Default is 10 minutes, hard-coded in
+# `warpgate-core/src/auth_state_store.rs`, and not reachable from the config
+# file.
+WG_APPROVAL_TIMEOUT_S = os.getenv("WG_APPROVAL_TIMEOUT_S", "")
 SHARD_ID = os.getenv("SHARD_ID", "local")
 ARTIFACT_DIR = Path(os.getenv("ARTIFACT_DIR", "stall-artifacts")) / f"shard-{SHARD_ID}"
 
@@ -557,6 +566,30 @@ def _user_and_target(url: str, port: int):
     return user, target
 
 
+def _seed_approval_timeout(processes, log, seconds: int):
+    """Put `admin_approval_timeout_seconds` in the database before the node
+    under test starts.
+
+    russh's inactivity timeout is built once, from
+    `ssh.inactivity_timeout + admin_approval_timeout + 10s`
+    (`warpgate-protocol-ssh/src/server/mod.rs`), so setting the parameter
+    through the admin API of a running gateway does not move its own timer.
+    A throwaway node runs the migrations and writes the parameter; the measured
+    node then starts from its config, and so from its database."""
+    node = processes.start_wg(stdout=log, stderr=log)
+    wait_port(node.http_port, for_process=node.process, recv=False)
+    with admin_client(f"https://localhost:{node.http_port}") as api:
+        api.update_parameters(
+            sdk.ParameterUpdate(admin_approval_timeout_seconds=seconds)
+        )
+        # Read it back: a parameter that silently did not take would move
+        # russh's timer nowhere and the run would measure the default.
+        written = api.get_parameters().admin_approval_timeout_seconds
+        assert written == seconds, f"parameter did not take: {written!r}"
+    _stop_wg(node.process)
+    return node
+
+
 def _stop_wg(process):
     try:
         process.send_signal(signal.SIGINT)
@@ -615,9 +648,15 @@ def _run_iteration(
     resumed = False
 
     with log_path.open("w") as log:
+        seed = (
+            _seed_approval_timeout(processes, log, int(WG_APPROVAL_TIMEOUT_S))
+            if WG_APPROVAL_TIMEOUT_S
+            else None
+        )
         wg = processes.start_wg(
             stdout=log,
             stderr=log,
+            share_with=seed,
             config_patch=(
                 {"ssh": {"inactivity_timeout": WG_INACTIVITY}} if WG_INACTIVITY else None
             ),
@@ -837,6 +876,17 @@ def test_stalled_client_release_after_target_death(
     )
     _wait_sshd_banner(sshd_port)
 
+    # Printed before the first number: the run parameters decide what any of
+    # the numbers below are allowed to mean, and a log that does not carry
+    # them cannot be checked by anyone who did not launch it.
+    print(
+        f"CONFIG shard={SHARD_ID} inactivity={WG_INACTIVITY or '(default)'} "
+        f"admin_approval_timeout_s={WG_APPROVAL_TIMEOUT_S or '(default 600)'} "
+        f"observe_s={OBSERVE_S} iterations={ITERATIONS} kill={TARGET_KILL} "
+        f"rust_log={os.getenv('WG_RUST_LOG', 'audit=info,warpgate=debug')}",
+        flush=True,
+    )
+
     results = []
     for i in range(1, ITERATIONS + 1):
         artifacts = ARTIFACT_DIR / f"iter-{i:03d}"
@@ -861,6 +911,8 @@ def test_stalled_client_release_after_target_death(
         "iterations": ITERATIONS,
         "kill_mode": TARGET_KILL,
         "inactivity_timeout": WG_INACTIVITY or "(default)",
+        "admin_approval_timeout_s": WG_APPROVAL_TIMEOUT_S or "(default, 600)",
+        "rust_log": os.getenv("WG_RUST_LOG", "audit=info,warpgate=debug"),
         "threshold_s": THRESHOLD_S,
         "observe_s": OBSERVE_S,
         "stalled": sum(1 for r in results if r["stalled"]),
