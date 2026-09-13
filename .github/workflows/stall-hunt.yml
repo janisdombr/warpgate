@@ -4,11 +4,15 @@ name: Stall hunt
 #
 # The question: when a client stops reading until its SSH channel window is
 # empty and its target then dies, how long does the gateway hold the client's
-# TCP connection? Measured on macOS it is never -- still held at 240s, with a
-# reading client released in 3s. Warpgate runs on Linux, and the mechanism
-# runs through the kernel's handling of a write to a zero-window peer, which
-# is not the same code on the two platforms. So the number that decides what
-# PR #2549 may claim is the Linux one, and this is where it is taken.
+# TCP connection? On macOS it is released at russh's own timer,
+# `ssh.inactivity_timeout + admin_approval_timeout + 10s` -- 52.6s with the
+# approval timeout at 30s, 627.9s with it left at its 600s default -- while
+# the session itself closed at 22s. An earlier version of this comment said
+# "never", from runs whose observation window sat below that timer.
+# Warpgate runs on Linux, and the mechanism runs through the kernel's handling
+# of a write to a zero-window peer, which is not the same code on the two
+# platforms. So the number that decides what PR #2549 may claim is the Linux
+# one, and this is where it is taken.
 #
 # `tests/test_stall_unread_client_release.py` is a measuring instrument, not a
 # regression test. It refuses to infer that the client stalled, that the
@@ -30,7 +34,10 @@ on:
         default: "15s"
       observe:
         description: "Seconds to watch for a release after the target dies"
-        default: "240"
+        default: "180"
+      approval:
+        description: "admin_approval_timeout_seconds — the second term of russh's own timer"
+        default: "30"
       target_kill:
         description: "relay (instant RST) or docker (real container kill)"
         default: "relay"
@@ -158,7 +165,8 @@ jobs:
         env:
           WG_INACTIVITY: ${{ github.event.inputs.inactivity || '15s' }}
           ITERATIONS: ${{ github.event.inputs.iterations || '3' }}
-          OBSERVE_S: ${{ github.event.inputs.observe || '240' }}
+          OBSERVE_S: ${{ github.event.inputs.observe || '180' }}
+          WG_APPROVAL_TIMEOUT_S: ${{ github.event.inputs.approval || '30' }}
           THRESHOLD_S: ${{ github.event.inputs.observe || '240' }}
           TARGET_KILL: ${{ github.event.inputs.target_kill || 'relay' }}
           SHARD_ID: linux
