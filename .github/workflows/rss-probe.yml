@@ -1,0 +1,86 @@
+name: RSS probe
+
+# Fork-only. Not part of any PR.
+#
+# The question: on Linux, one of the five hostile-target modes reports the
+# gateway growing by ~270 MiB, and which mode reports it varies between runs
+# (garbage_after_banner once, banner_gigantic once). The modes send 16 KiB and
+# 8 MiB respectively, so the number cannot be their read buffer. The test
+# measures an RSS delta on one gateway shared by all five modes. This runs the
+# same five modes twice: against the shared gateway, printing what it sees, and
+# against a fresh gateway per mode. If the fresh cells are flat and the shared
+# ones are not, the number belongs to the process, not the mode.
+#
+# `tests/test_stall_unread_client_release.py` is a measuring instrument, not a
+# regression test. It refuses to infer that the client stalled, that the
+# gateway let go, or that its threshold means anything -- and this workflow
+# adds the fourth refusal that only a port needs: it will not report a number
+# until the socket parser has been shown to read a live connection on this
+# runner.
+
+on:
+  push:
+    branches: [ "tooling/rss-probe" ]
+  workflow_dispatch:
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: "test"
+
+      - name: Install build deps
+        run: |
+          sudo apt-get install -y openssh-client expect lsof iproute2
+          cargo install --locked just@1.4.0
+
+      # the parser is built on at all? A kernel or an iproute2 that does not
+      # is worth learning about before ten minutes of build.
+      - name: Build UI
+        run: |
+          just npm ci
+          just openapi
+          just npm run openapi:tests-sdk
+          just npm run build
+
+      - name: Build the gateway
+        run: cargo build --bin warpgate --all-features
+
+      - name: Build images
+        working-directory: tests
+        run: make all
+
+      - name: Install deps
+        working-directory: tests
+        run: |
+          pip3 install poetry==1.8.3
+          # --no-root: `tests` is a dependency set, not a package, and newer
+          # poetry refuses to install it as one. Not `|| true`, which would
+          # also swallow a dependency that genuinely failed to resolve.
+          poetry install --no-root
+
+
+      - name: Five modes, shared gateway then fresh gateway, three rounds
+        working-directory: tests
+        env:
+          TIMEOUT: "120"
+        run: |
+          set +e
+          for round in 1 2 3; do
+            echo "### round $round shared"
+            poetry run pytest "test_vault_hostile_target.py::test_a_hostile_target_cannot_hang_or_crash_the_gateway" -q -s -p no:cacheprovider 2>&1 | grep -E "^PROBE|passed|failed"
+            echo "### round $round fresh"
+            poetry run pytest "test_vault_hostile_target.py::test_probe_growth_on_a_fresh_gateway" -q -s -p no:cacheprovider 2>&1 | grep -E "^PROBE|passed|failed"
+          done
+          echo "### PROBE DONE"

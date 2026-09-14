@@ -107,6 +107,7 @@ def test_a_hostile_target_cannot_hang_or_crash_the_gateway(
 
         # An unbounded read shows up here rather than in the exit code.
         growth = gateway.memory_info().rss - rss_before
+        print(f"PROBE shared-gateway {mode}: rss_before={rss_before // (1024*1024)}MiB growth={growth // (1024*1024)}MiB rss_after={gateway.memory_info().rss // (1024*1024)}MiB elapsed={elapsed:.1f}s", flush=True)
         assert growth < 256 * 1024 * 1024, (
             f"{mode} grew the gateway by {growth // (1024 * 1024)} MiB"
         )
@@ -406,3 +407,44 @@ def test_break_glass_user_creation_does_not_depend_on_vault(
     # were missing or the config unparseable — neither of which is this guard.
     assert "invalid Vault role or mount name" not in output, output[-600:]
     assert result.returncode == 0, output[-600:]
+
+
+
+@pytest.fixture
+def fresh_cert_wg(processes: ProcessManager, ctx, stub_vault):
+    """One gateway per test invocation, so nothing a previous mode did is in RSS."""
+    token_path = ctx.tmpdir / f"sa-token-{uuid4()}"
+    token_path.write_text(SERVICE_ACCOUNT_JWT)
+    wg = processes.start_wg(
+        config_patch={
+            "vault": {
+                "address": stub_vault.url,
+                "ca_bundle": stub_vault.ca_bundle,
+                "default_role": "warpgate",
+                "auth": {"kind": "kubernetes", "role": "warpgate", "token_path": str(token_path)},
+            }
+        }
+    )
+    wait_port(wg.http_port, for_process=wg.process, recv=False)
+    wait_port(wg.ssh_port, for_process=wg.process)
+    return wg
+
+
+@pytest.mark.parametrize("mode", sorted(set(MODES) - {"silent_after_banner"}))
+def test_probe_growth_on_a_fresh_gateway(processes, fresh_cert_wg, honest_target, stub_vault, timeout, mode):
+    from .test_ssh_target_cert_auth import connect
+    import psutil
+    with admin_client(f"https://localhost:{fresh_cert_wg.http_port}") as api:
+        server = HostileSSHServer(mode)
+        server.start()
+        try:
+            user, target = target_on(api, server.port)
+            gateway = psutil.Process(fresh_cert_wg.process.pid)
+            rss_before = gateway.memory_info().rss
+            started = time.time()
+            code, _ = connect(processes, fresh_cert_wg, user, target, timeout)
+            elapsed = time.time() - started
+            growth = gateway.memory_info().rss - rss_before
+            print(f"PROBE fresh-gateway {mode}: rss_before={rss_before // (1024*1024)}MiB growth={growth // (1024*1024)}MiB rss_after={gateway.memory_info().rss // (1024*1024)}MiB elapsed={elapsed:.1f}s code={code}", flush=True)
+        finally:
+            server.stop()
