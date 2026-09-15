@@ -40,7 +40,9 @@ jobs:
           just npm run openapi:tests-sdk
           just npm run build
       - name: Build the gateway the way the Test workflow does (coverage)
-        run: cargo llvm-cov --no-cfg-coverage-nightly --no-report --workspace --all-features -- --skip agent
+        # Exactly what tests/conftest.py does at session start: this is the
+        # invocation that produces target/llvm-cov-target/debug/warpgate.
+        run: cargo llvm-cov run --no-cfg-coverage-nightly --all-features --no-report -- version
       - name: Measure
         working-directory: tests
         run: |
