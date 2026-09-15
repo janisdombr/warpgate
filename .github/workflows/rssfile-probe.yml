@@ -57,7 +57,7 @@ jobs:
           WARPGATE_ADMIN_PASSWORD=123 $BIN --config /tmp/wg/warpgate.yaml unattended-setup \
             --ssh-port 2222 --http-port 8888 --mysql-port 33306 --postgres-port 55432 --kubernetes-port 6444 \
             --data-path /tmp/wg --external-host localhost --record-sessions --host-key-verification auto-accept \
-            --import-ssh-keys $PWD/ssh-keys/wg > /tmp/setup.log 2>&1
+            > /tmp/setup.log 2>&1 || { echo "### setup failed:"; tail -20 /tmp/setup.log; exit 1; }
           WARPGATE_ADMIN_TOKEN=token-value LLVM_PROFILE_FILE=/tmp/wg-%m.profraw $BIN --config /tmp/wg/warpgate.yaml run --enable-admin-token > /tmp/wg.log 2>&1 &
           WGPID=$!
           sleep 8
