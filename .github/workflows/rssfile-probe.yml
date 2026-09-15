@@ -39,7 +39,7 @@ jobs:
           just npm run openapi:tests-sdk
           just npm run build
       - name: Build the gateway the way the Test workflow does (coverage)
-        run: cargo llvm-cov --no-cfg-coverage-nightly --no-report --workspace --all-features --no-run
+        run: cargo llvm-cov --no-cfg-coverage-nightly --no-report --workspace --all-features -- --skip agent
       - name: Measure
         working-directory: tests
         run: |
