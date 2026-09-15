@@ -1,0 +1,68 @@
+name: RssFile probe
+
+# Fork-only. Does VmRSS of a coverage-instrumented gateway move by hundreds of
+# MiB with no heap change, purely through the kernel evicting and re-faulting
+# the binary's file-backed pages under memory pressure? If yes, a guard on
+# psutil.rss is measuring the page cache, not the process.
+
+on:
+  push:
+    branches: [ "tooling/rss-probe" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: "test"
+      - name: Install build deps
+        run: |
+          sudo apt-get install -y openssh-client expect lsof iproute2 stress-ng
+          cargo install --locked just@1.4.0
+          cargo install --locked cargo-llvm-cov@0.6.15
+      - name: Build UI
+        run: |
+          just npm ci
+          just openapi
+          just npm run openapi:tests-sdk
+          just npm run build
+      - name: Build the gateway the way the Test workflow does (coverage)
+        run: cargo llvm-cov --no-cfg-coverage-nightly --no-report --workspace --all-features --no-run
+      - name: Measure
+        working-directory: tests
+        run: |
+          set -x
+          BIN=$(ls ../target/llvm-cov-target/debug/warpgate)
+          ls -la $BIN
+          cp -r certs /tmp/certs 2>/dev/null || true
+          mkdir -p /tmp/wg && cp certs/tls.certificate.pem certs/tls.key.pem /tmp/wg/ 2>/dev/null || true
+          WARPGATE_ADMIN_PASSWORD=123 $BIN --config /tmp/wg/warpgate.yaml unattended-setup \
+            --ssh-port 2222 --http-port 8888 --mysql-port 33306 --postgres-port 55432 --kubernetes-port 6444 \
+            --data-path /tmp/wg --external-host localhost --record-sessions --host-key-verification auto-accept \
+            --import-ssh-keys $PWD/ssh-keys/wg > /tmp/setup.log 2>&1
+          WARPGATE_ADMIN_TOKEN=token-value LLVM_PROFILE_FILE=/tmp/wg-%m.profraw $BIN --config /tmp/wg/warpgate.yaml run --enable-admin-token > /tmp/wg.log 2>&1 &
+          WGPID=$!
+          sleep 8
+          snap() { echo "--- $1"; grep -E "^(VmRSS|RssAnon|RssFile|RssShmem|VmHWM)" /proc/$WGPID/status | tr '\n' ' '; echo; }
+          snap "idle after start"
+          for i in 1 2 3; do ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -p 2222 nobody:none@localhost true 2>/dev/null || true; done
+          snap "after 3 ssh connections"
+          echo "### applying memory pressure: 90% of RAM for 25s"
+          stress-ng --vm 2 --vm-bytes 90% --vm-keep --timeout 25s >/dev/null 2>&1 || true
+          snap "after pressure, idle"
+          for i in 1 2 3; do ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -p 2222 nobody:none@localhost true 2>/dev/null || true; done
+          snap "after pressure + 3 ssh connections"
+          echo "### PROBE DONE"
+          kill $WGPID || true
