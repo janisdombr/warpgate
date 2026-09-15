@@ -96,10 +96,14 @@ def test_a_hostile_target_cannot_hang_or_crash_the_gateway(
 
         gateway = psutil.Process(cert_wg.process.pid)
         rss_before = gateway.memory_info().rss
+        snap_before = _mem_snapshot(cert_wg.process.pid)
 
         started = time.time()
         code, _ = connect(processes, cert_wg, user, target, timeout)
         elapsed = time.time() - started
+        snap_after = _mem_snapshot(cert_wg.process.pid)
+        print(f"PROBE2 {mode} before={snap_before}", flush=True)
+        print(f"PROBE2 {mode} after={snap_after}", flush=True)
 
         assert server.connections > 0, f"the {mode} server was never reached"
         assert code != 0, f"a session completed against a {mode} server"
@@ -408,6 +412,34 @@ def test_break_glass_user_creation_does_not_depend_on_vault(
     assert "invalid Vault role or mount name" not in output, output[-600:]
     assert result.returncode == 0, output[-600:]
 
+
+
+def _mem_snapshot(pid):
+    """Linux-only: anon vs file vs shmem, and the biggest mappings, so a jump
+    can be attributed to a heap, a file, or a specific region."""
+    out = {}
+    try:
+        for line in open(f"/proc/{pid}/status"):
+            k, _, v = line.partition(":")
+            if k in ("VmRSS", "RssAnon", "RssFile", "RssShmem", "VmSwap", "Threads", "VmHWM"):
+                out[k] = v.strip()
+        fds = len(__import__("os").listdir(f"/proc/{pid}/fd"))
+        out["fds"] = fds
+        # top mappings by Rss
+        regions = []
+        cur = None
+        for line in open(f"/proc/{pid}/smaps"):
+            if not line[0].isspace() and "-" in line.split()[0]:
+                parts = line.split()
+                cur = [parts[0], parts[-1] if len(parts) > 5 else "[anon]", 0]
+                regions.append(cur)
+            elif line.startswith("Rss:") and cur is not None:
+                cur[2] = int(line.split()[1])
+        regions.sort(key=lambda r: -r[2])
+        out["top"] = [f"{r[1]}={r[2]//1024}MiB" for r in regions[:5]]
+    except Exception as e:  # noqa: BLE001 - macOS has no /proc
+        out["err"] = repr(e)[:60]
+    return out
 
 
 @pytest.fixture

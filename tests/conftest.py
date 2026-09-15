@@ -897,7 +897,9 @@ class ProcessManager:
                 setup_args += ["--database-url", database_url]
             p = run(
                 setup_args,
-                env={"WARPGATE_ADMIN_PASSWORD": "123"},
+                # PROBE: every migration announces itself, so a failing setup
+                # names the migration rather than the last one that logged.
+                env={"WARPGATE_ADMIN_PASSWORD": "123", "RUST_LOG": "info,sea_orm_migration=info,warpgate_db_migrations=debug"},
             )
             p.communicate()
 
