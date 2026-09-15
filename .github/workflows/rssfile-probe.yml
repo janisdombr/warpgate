@@ -30,6 +30,7 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get install -y openssh-client expect lsof iproute2 stress-ng
+          rustup component add llvm-tools-preview
           cargo install --locked just@1.4.0
           cargo install --locked cargo-llvm-cov@0.6.15
       - name: Build UI
@@ -44,8 +45,11 @@ jobs:
         working-directory: tests
         run: |
           set -x
-          BIN=$(ls ../target/llvm-cov-target/debug/warpgate)
-          ls -la $BIN
+          echo "### where did the coverage build put the gateway binary?"
+          find ../target -maxdepth 4 -type f -name warpgate -perm -u+x -exec ls -la {} \;
+          BIN=$(find ../target -maxdepth 4 -type f -name warpgate -perm -u+x | grep llvm-cov | head -1)
+          [ -z "$BIN" ] && BIN=$(find ../target -maxdepth 4 -type f -name warpgate -perm -u+x | head -1)
+          echo "using BIN=$BIN"; ls -la "$BIN"
           cp -r certs /tmp/certs 2>/dev/null || true
           mkdir -p /tmp/wg && cp certs/tls.certificate.pem certs/tls.key.pem /tmp/wg/ 2>/dev/null || true
           WARPGATE_ADMIN_PASSWORD=123 $BIN --config /tmp/wg/warpgate.yaml unattended-setup \
