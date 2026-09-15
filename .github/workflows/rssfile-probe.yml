@@ -60,7 +60,11 @@ jobs:
             > /tmp/setup.log 2>&1 || { echo "### setup failed:"; tail -20 /tmp/setup.log; exit 1; }
           WARPGATE_ADMIN_TOKEN=token-value LLVM_PROFILE_FILE=/tmp/wg-%m.profraw $BIN --config /tmp/wg/warpgate.yaml run --enable-admin-token > /tmp/wg.log 2>&1 &
           WGPID=$!
-          sleep 8
+          for i in $(seq 1 30); do (echo > /dev/tcp/127.0.0.1/2222) 2>/dev/null && break; sleep 1; done
+          if ! kill -0 $WGPID 2>/dev/null || grep -q "^State:.*Z" /proc/$WGPID/status; then
+            echo "### gateway is not running; its log:"; tail -30 /tmp/wg.log; echo "### setup log:"; tail -10 /tmp/setup.log; exit 1
+          fi
+          echo "### gateway alive, pid $WGPID, config:"; cat /tmp/wg/warpgate.yaml | head -30
           snap() { echo "--- $1"; grep -E "^(VmRSS|RssAnon|RssFile|RssShmem|VmHWM)" /proc/$WGPID/status | tr '\n' ' '; echo; }
           snap "idle after start"
           for i in 1 2 3; do ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -p 2222 nobody:none@localhost true 2>/dev/null || true; done
