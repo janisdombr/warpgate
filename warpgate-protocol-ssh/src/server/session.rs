@@ -148,6 +148,7 @@ pub struct ServerSession {
     /// the client id (and thus the owning channel) is unknown, so unlike
     /// target-side events they can't be held on the channel itself.
     deferred_server_events: Vec<ServerHandlerEvent>,
+    probe_replay_depth: usize,
     /// Events taken off the queue past [`MAX_NESTED_COMMAND_WAITS`], replayed by
     /// the main event loop once the nesting unwinds.
     pending_events: VecDeque<Event>,
@@ -290,6 +291,7 @@ impl ServerSession {
             session_handle: None,
             channels: ChannelRegistry::new(),
             deferred_server_events: vec![],
+            probe_replay_depth: 0,
             pending_events: VecDeque::new(),
             command_wait_depth: 0,
             rc_tx: rc_handles.command_tx.clone(),
@@ -980,10 +982,27 @@ impl ServerSession {
     }
 
     async fn replay_deferred_server_events(&mut self) -> Result<(), WarpgateError> {
-        for event in std::mem::take(&mut self.deferred_server_events) {
-            self.handle_event(Event::ServerHandler(event)).await?;
+        // PROBE (not for upstream): measure the recursion this function creates.
+        // `marker` sits on the stack of this frame, so the difference between
+        // two nested frames' addresses is the stack each replay level costs.
+        let marker = 0u8;
+        let sp = std::ptr::from_ref(&marker) as usize;
+        self.probe_replay_depth += 1;
+        let depth = self.probe_replay_depth;
+        let queued = self.deferred_server_events.len();
+        warn!(probe = "replay", depth, queued, sp, "PROBE replay entered");
+        if depth == 6 {
+            warn!(probe = "replay", depth, backtrace = %std::backtrace::Backtrace::force_capture(), "PROBE deep replay");
         }
-        Ok(())
+        let mut result = Ok(());
+        for event in std::mem::take(&mut self.deferred_server_events) {
+            if let Err(error) = self.handle_event(Event::ServerHandler(event)).await {
+                result = Err(error);
+                break;
+            }
+        }
+        self.probe_replay_depth -= 1;
+        result
     }
 
     async fn start_target_selection_menu(&self, channel_id: Uuid) -> Result<()> {
