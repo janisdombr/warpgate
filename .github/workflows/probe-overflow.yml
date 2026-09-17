@@ -1,0 +1,118 @@
+name: Probe stack overflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      channels:
+        description: "channels opened while the gate is held"
+        default: "16"
+      settle:
+        description: "seconds to let the opens queue before approving"
+        default: "8"
+  push:
+    branches: [probe/ssh-stack-overflow]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: [baseline, flattened]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: false
+          large-packages: false
+          docker-images: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: "probe-${{ matrix.cell }}"
+
+      - name: Apply the cell's source
+        run: |
+          if [ "${{ matrix.cell }}" = "flattened" ]; then
+            git apply probe-fix-flatten.patch
+          fi
+          # Fingerprint: what this cell actually compiled, printed above the numbers.
+          echo "CELL=${{ matrix.cell }}"
+          echo "reentrant dispatches left in the replay path: $(grep -c 'self.handle_event(Event::ServerHandler(event))' warpgate-protocol-ssh/src/server/session.rs)"
+          echo "queued dispatches in the replay path: $(grep -c 'pending_events.push_back(Event::ServerHandler(event))' warpgate-protocol-ssh/src/server/session.rs)"
+          echo "queued client events on confirm: $(grep -c 'pending_events.push_back(Event::Client(event))' warpgate-protocol-ssh/src/server/session.rs)"
+
+      - name: Install build deps
+        run: |
+          sudo apt-get install openssh-client expect
+          cargo install --locked just@1.4.0
+          cargo install --locked cargo-llvm-cov@0.6.15
+          rustup component add llvm-tools-preview
+
+      - name: Build UI
+        run: |
+          just npm ci
+          just openapi
+          just npm run openapi:tests-sdk
+          just npm run build
+
+      - name: Build images
+        working-directory: tests
+        run: make all
+
+      - name: Install test deps
+        working-directory: tests
+        run: |
+          sudo apt update
+          sudo apt install -y gnome-keyring
+          pip3 install keyring==24 poetry==1.8.3
+          poetry install
+
+      - name: Build the gateway the way the test suite does
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --no-cfg-coverage-nightly --no-report --workspace --all-features -- --skip agent
+
+      - name: Run the probe
+        working-directory: tests
+        env:
+          PROBE_CHANNELS: ${{ github.event.inputs.channels || '16' }}
+          PROBE_SETTLE: ${{ github.event.inputs.settle || '8' }}
+          TIMEOUT: "120"
+          ENABLE_COVERAGE: "1"
+          RUST_BACKTRACE: "1"
+        run: |
+          set +e
+          poetry run pytest test_zz_overflow_probe.py -s -p no:cacheprovider > probe.log 2>&1
+          echo "pytest exit=$?"
+          echo "=== cell ${{ matrix.cell }} : PROBE lines"
+          grep -E 'PROBE replay entered' probe.log | tail -20
+          echo "=== deepest replay depth reached"
+          grep -oE 'depth=[0-9]+' probe.log | sort -t= -k2 -n | tail -1
+          echo "=== stack bytes per replay level (sp deltas)"
+          grep -oE 'depth=[0-9]+ queued=[0-9]+ sp=[0-9]+' probe.log | tail -12
+          echo "=== crash?"
+          grep -c 'overflowed its stack' probe.log
+          echo "=== backtrace at depth 6, if any"
+          sed -n '/PROBE deep replay/,+40p' probe.log | head -60
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: probe-${{ matrix.cell }}
+          path: tests/probe.log
