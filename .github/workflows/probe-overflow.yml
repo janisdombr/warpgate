@@ -101,7 +101,7 @@ jobs:
           for i in 1 2 3; do
             poetry run pytest test_zz_overflow_probe.py -s -p no:cacheprovider > probe-$i.log 2>&1
             rc=$?
-            c=$(grep -c 'overflowed its stack' probe-$i.log)
+            c=$(grep -c 'overflowed its stack' probe-$i.log || true)
             echo "run $i: pytest exit=$rc stack_overflow=$c max_wait_depth=$(grep -oE 'PROBE command wait entered probe="wait" depth=[0-9]+' probe-$i.log | grep -oE '[0-9]+$' | sort -n | tail -1)"
             crashes=$((crashes + c))
           done
@@ -114,7 +114,7 @@ jobs:
           echo "=== stack bytes per replay level (sp deltas)"
           grep -oE 'probe="wait" depth=[0-9]+ sp=[0-9]+' probe.log | tail -14
           echo "=== crash?"
-          grep -c 'overflowed its stack' probe.log
+          echo "stack overflows: $(grep -c 'overflowed its stack' probe.log || true)"
           echo "=== backtrace at depth 6, if any"
           sed -n '/PROBE deep command wait/,+45p' probe.log | head -60
 
@@ -128,7 +128,7 @@ jobs:
           poetry run pytest test_ssh_approval_close.py test_ssh_proto.py test_ssh_host_keys.py -q -p no:cacheprovider > suite.log 2>&1
           echo "suite exit=$? :: $(grep -E '^[0-9]+ (passed|failed)|=+ .*(passed|failed)' suite.log | tail -1)"
           grep -E '^FAILED' suite.log | head -10
-          grep -c 'overflowed its stack' suite.log
+          echo "stack overflows during the suite: $(grep -c 'overflowed its stack' suite.log || true)"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
