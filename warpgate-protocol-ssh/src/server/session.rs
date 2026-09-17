@@ -2656,6 +2656,23 @@ impl ServerSession {
         };
 
         self.command_wait_depth += 1;
+        {
+            // PROBE (not for upstream): this is the re-entrant pump. `marker`
+            // lives on this frame, so successive depths' addresses measure the
+            // stack each nested wait costs.
+            let marker = 0u8;
+            let sp = std::ptr::from_ref(&marker) as usize;
+            warn!(
+                probe = "wait",
+                depth = self.command_wait_depth,
+                sp,
+                capped = self.command_wait_depth > MAX_NESTED_COMMAND_WAITS,
+                "PROBE command wait entered"
+            );
+            if self.command_wait_depth == 5 {
+                warn!(probe = "wait", depth = self.command_wait_depth, backtrace = %std::backtrace::Backtrace::force_capture(), "PROBE deep command wait");
+            }
+        }
         let result = loop {
             tokio::select! {
                 result = &mut cmd => {

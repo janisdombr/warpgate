@@ -98,21 +98,29 @@ jobs:
           RUST_BACKTRACE: "1"
         run: |
           set +e
-          poetry run pytest test_zz_overflow_probe.py -s -p no:cacheprovider > probe.log 2>&1
-          echo "pytest exit=$?"
+          crashes=0
+          for i in 1 2 3; do
+            poetry run pytest test_zz_overflow_probe.py -s -p no:cacheprovider > probe-$i.log 2>&1
+            rc=$?
+            c=$(grep -c 'overflowed its stack' probe-$i.log)
+            echo "run $i: pytest exit=$rc stack_overflow=$c max_wait_depth=$(grep -oE 'PROBE command wait entered probe="wait" depth=[0-9]+' probe-$i.log | grep -oE '[0-9]+$' | sort -n | tail -1)"
+            crashes=$((crashes + c))
+          done
+          cp probe-3.log probe.log
+          echo "CELL ${{ matrix.cell }}: $crashes of 3 runs aborted the gateway"
           echo "=== cell ${{ matrix.cell }} : PROBE lines"
-          grep -E 'PROBE replay entered' probe.log | tail -20
+          grep -E 'PROBE command wait entered' probe.log | tail -20
           echo "=== deepest replay depth reached"
-          grep -oE 'depth=[0-9]+' probe.log | sort -t= -k2 -n | tail -1
+          grep -oE 'probe="wait" depth=[0-9]+' probe.log | grep -oE '[0-9]+$' | sort -n | tail -1
           echo "=== stack bytes per replay level (sp deltas)"
-          grep -oE 'depth=[0-9]+ queued=[0-9]+ sp=[0-9]+' probe.log | tail -12
+          grep -oE 'probe="wait" depth=[0-9]+ sp=[0-9]+' probe.log | tail -14
           echo "=== crash?"
           grep -c 'overflowed its stack' probe.log
           echo "=== backtrace at depth 6, if any"
-          sed -n '/PROBE deep replay/,+40p' probe.log | head -60
+          sed -n '/PROBE deep command wait/,+45p' probe.log | head -60
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: probe-${{ matrix.cell }}
-          path: tests/probe.log
+          path: tests/probe-*.log
