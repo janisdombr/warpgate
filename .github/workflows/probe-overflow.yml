@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cell: [baseline, flattened]
+        cell: [baseline, cap2, cap1]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -48,14 +48,13 @@ jobs:
 
       - name: Apply the cell's source
         run: |
-          if [ "${{ matrix.cell }}" = "flattened" ]; then
-            git apply probe-fix-flatten.patch
-          fi
+          case "${{ matrix.cell }}" in
+            cap2) sed -i 's/^const MAX_NESTED_COMMAND_WAITS: usize = 16;/const MAX_NESTED_COMMAND_WAITS: usize = 2;/' warpgate-protocol-ssh/src/server/session.rs ;;
+            cap1) sed -i 's/^const MAX_NESTED_COMMAND_WAITS: usize = 16;/const MAX_NESTED_COMMAND_WAITS: usize = 1;/' warpgate-protocol-ssh/src/server/session.rs ;;
+          esac
           # Fingerprint: what this cell actually compiled, printed above the numbers.
           echo "CELL=${{ matrix.cell }}"
-          echo "reentrant dispatches left in the replay path: $(grep -c 'self.handle_event(Event::ServerHandler(event))' warpgate-protocol-ssh/src/server/session.rs)"
-          echo "queued dispatches in the replay path: $(grep -c 'pending_events.push_back(Event::ServerHandler(event))' warpgate-protocol-ssh/src/server/session.rs)"
-          echo "queued client events on confirm: $(grep -c 'pending_events.push_back(Event::Client(event))' warpgate-protocol-ssh/src/server/session.rs)"
+          grep -n '^const MAX_NESTED_COMMAND_WAITS' warpgate-protocol-ssh/src/server/session.rs
 
       - name: Install build deps
         run: |
@@ -119,8 +118,22 @@ jobs:
           echo "=== backtrace at depth 6, if any"
           sed -n '/PROBE deep command wait/,+45p' probe.log | head -60
 
+      - name: The suites that exercise the pump must stay green
+        working-directory: tests
+        env:
+          TIMEOUT: "120"
+          ENABLE_COVERAGE: "1"
+        run: |
+          set +e
+          poetry run pytest test_ssh_approval_close.py test_ssh_proto.py test_ssh_host_keys.py -q -p no:cacheprovider > suite.log 2>&1
+          echo "suite exit=$? :: $(grep -E '^[0-9]+ (passed|failed)|=+ .*(passed|failed)' suite.log | tail -1)"
+          grep -E '^FAILED' suite.log | head -10
+          grep -c 'overflowed its stack' suite.log
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: probe-${{ matrix.cell }}
-          path: tests/probe-*.log
+          path: |
+            tests/probe-*.log
+            tests/suite.log
