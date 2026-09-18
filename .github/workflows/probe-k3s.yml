@@ -1,0 +1,66 @@
+name: Probe k3s cgroups
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "k3s starts per cell"
+        default: "3"
+  push:
+    branches: [probe/k3s-cgroups]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: [baseline, cgroupns-host]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: What this runner's cgroup root looks like before anything starts
+        run: |
+          echo "cgroup version: $(stat -fc %T /sys/fs/cgroup)"
+          echo "controllers available: $(cat /sys/fs/cgroup/cgroup.controllers)"
+          echo "controllers delegated: $(cat /sys/fs/cgroup/cgroup.subtree_control)"
+          echo "processes in the root cgroup: $(wc -l < /sys/fs/cgroup/cgroup.procs)"
+          docker version --format '{{.Server.Version}}'
+
+      - name: Start k3s the way tests/conftest.py does, ${{ matrix.cell }}
+        env:
+          RUNS: ${{ github.event.inputs.runs || '3' }}
+        run: |
+          set +e
+          flag=""
+          [ "${{ matrix.cell }}" = "cgroupns-host" ] && flag="--cgroupns=host"
+          echo "CELL=${{ matrix.cell }}  docker flag: [${flag:-none}]"
+          ok=0; dead=0; ebusy_total=0
+          for i in $(seq 1 "$RUNS"); do
+            name="probe-k3s-$i"
+            docker rm -f "$name" >/dev/null 2>&1
+            docker run -d --rm --name "$name" --privileged $flag -p $((16440+i)):6443 \
+              rancher/k3s:v1.35.2-k3s1 server --disable traefik --disable-cloud-controller >/dev/null
+            # Same readiness wait as the suite: poll the API through kubectl.
+            up=0
+            for t in $(seq 1 60); do
+              if docker exec "$name" kubectl get --raw /readyz >/dev/null 2>&1; then up=1; break; fi
+              sleep 5
+            done
+            log=$(docker logs "$name" 2>&1)
+            ebusy=$(printf '%s' "$log" | grep -c 'cgroup.subtree_control: device or resource busy')
+            kubelet_dead=$(printf '%s' "$log" | grep -c 'Failed to start ContainerManager')
+            ebusy_total=$((ebusy_total + ebusy))
+            if [ "$up" = 1 ] && [ "$kubelet_dead" = 0 ]; then ok=$((ok+1)); else dead=$((dead+1)); fi
+            echo "run $i: api_ready=$up kubelet_ContainerManager_failures=$kubelet_dead subtree_control_EBUSY_lines=$ebusy"
+            printf '%s' "$log" | grep -oE 'failed to enable controller \\"[a-z]+\\"' | sort | uniq -c | sed 's/^/    /'
+            docker rm -f "$name" >/dev/null 2>&1
+          done
+          echo "CELL ${{ matrix.cell }}: $ok of $RUNS starts healthy, $dead unhealthy, $ebusy_total EBUSY lines in total"

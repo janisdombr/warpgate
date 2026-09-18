@@ -331,6 +331,13 @@ class ProcessManager:
                 "--name",
                 container_name,
                 "--privileged",
+                # PROBE cell: with the flag the container shares the host's
+                # cgroup hierarchy; without it k3s gets a private cgroup
+                # namespace whose root holds its own processes, and cgroup v2
+                # refuses to delegate controllers to a group that has
+                # processes in it -- kubelet then dies on missing cpu/memory/
+                # pids controllers.
+                *(["--cgroupns=host"] if os.getenv("PROBE_CGROUPNS_HOST") else []),
                 "-p",
                 f"{port}:6443",
                 image,
