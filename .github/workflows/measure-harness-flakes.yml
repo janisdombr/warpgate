@@ -1,0 +1,422 @@
+# Fork-only measurement of three test-harness defects. Never part of an upstream PR.
+#
+# Specification: .devkit/audit/scope-three-flakes.md (ROUND 2 — REVISED) and the
+# Codex round-2 report's required plan changes. Everything below is predeclared:
+# trial counts, batch size, arms, stress recipe and ceilings are fixed here and
+# no cell is extended after a look at its result.
+#
+#   M1 (D3)  hold-drain test: C0 vs C1, 600 per arm, idle and stressed.
+#   M2 (D1)  config/ca duration: {Vault 1.20, OpenBao 2.5.0} x {default, ed25519},
+#            100 fresh containers per cell, 4 shards x 25 of every cell.
+#   M3 (D2)  oversized-body test: deterministic controls on C2 first, then C0 vs
+#            C2, 1000 per arm, stressed.
+#   D4 is not measured: source and log already establish it.
+#
+# M1 and M3 trials are independent invocations of the arm's test binary, one
+# process per trial, so their rates are per-invocation rates. Baseline and
+# treatment always run in the same job, interleaved in batches of 50.
+#
+# Dispatch only, and only on measure/harness-flakes, so pushing this file cannot
+# start it.
+
+name: Measure harness flakes (fork-only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: measure-harness-flakes
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # The arms, by exact commit. C0 is the unmodified head the defects were
+  # observed on; C1, C2 and C3 are its children on this branch.
+  C0_SHA: 67e59afb9c17d52c7da736b39e8c4046c414fb95
+  C1_SHA: a5e84f857ca69a30c4d98ae0e9e140b2b915a632
+  C2_SHA: 3f28f62d1429ef7f884a56e74ad3202197588f0f
+  C3_SHA: fb1a011dd60b2d0dc0c8e0b53ed6d688bc2ed0d5
+  BATCH: 50
+  M1_N_PER_ARM: 600
+  M3_N_PER_ARM: 1000
+  M2_SHARDS: 4
+  M2_PER_CELL_PER_SHARD: 25
+  M1_TEST: server::hold_screen::hold_while_tests::viewer_input_does_not_pile_up_behind_the_hold
+  M3_TEST: client::tests::test_an_oversized_success_body_is_refused_rather_than_buffered
+  M3_NEGATIVE_CONTROL: client::tests::a_body_cut_short_below_the_limit_is_a_transport_error
+  M3_NEGATIVE_PROOF: client::tests::the_size_assertion_rejects_a_truncated_body
+  HARNESS: .github/measure/harness-flakes
+  CARGO_TERM_COLOR: never
+
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Refuse any ref but the measurement branch
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/measure/harness-flakes ]; then
+            echo "::error::this workflow runs only on measure/harness-flakes, not $GITHUB_REF"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Every arm is on this branch's history
+        run: |
+          for sha in "$C0_SHA" "$C1_SHA" "$C2_SHA" "$C3_SHA"; do
+            git merge-base --is-ancestor "$sha" HEAD || { echo "::error::$sha is not an ancestor of $(git rev-parse HEAD)"; exit 1; }
+          done
+          # Each candidate is exactly one commit on top of the previous, so an
+          # arm differs from its baseline only by the change it names.
+          [ "$(git rev-parse "$C1_SHA^")" = "$C0_SHA" ] || { echo "::error::C1 is not a child of C0"; exit 1; }
+          [ "$(git rev-parse "$C2_SHA^")" = "$C1_SHA" ] || { echo "::error::C2 is not a child of C1"; exit 1; }
+          [ "$(git rev-parse "$C3_SHA^")" = "$C2_SHA" ] || { echo "::error::C3 is not a child of C2"; exit 1; }
+          # M3 compares C0 with C2, whose tree also carries C1's rdp test
+          # change. warpgate-vault does not depend on the rdp crate, so the
+          # vault test binaries differ only by C2's change; assert the file set
+          # so nothing else can slip into either comparison.
+          expect() {
+            local from=$1 to=$2 want=$3 got
+            got=$(git diff --name-only "$from" "$to" | sort | tr '\n' ' ')
+            echo "$from..$to: $got"
+            [ "$got" = "$want" ] || { echo "::error::$from..$to changes '$got', expected '$want'"; exit 1; }
+          }
+          expect "$C0_SHA" "$C1_SHA" "warpgate-protocol-rdp/src/server/hold_screen.rs "
+          expect "$C0_SHA" "$C2_SHA" "warpgate-protocol-rdp/src/server/hold_screen.rs warpgate-vault/src/client.rs "
+          expect "$C2_SHA" "$C3_SHA" "tests/vault_server.py "
+          echo "workflow commit: $(git rev-parse HEAD)"
+
+  m1:
+    name: M1 (D3) hold-drain test, C0 vs C1, idle and stressed
+    needs: guard
+    runs-on: ubuntu-24.04
+    # Shorter than the stressor's own 3 h timeout, so stress-ng cannot expire mid-run.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: false
+          large-packages: false
+          docker-images: false
+
+      - name: Paths
+        run: |
+          echo "ARMS_DIR=$RUNNER_TEMP/arms" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/target" >> "$GITHUB_ENV"
+          echo "OUT_DIR=$RUNNER_TEMP/out/m1" >> "$GITHUB_ENV"
+
+      - name: Install stress-ng and record the stand (before any timing)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y stress-ng
+          mkdir -p "$OUT_DIR"
+          {
+            echo "workflow_sha=$(git rev-parse HEAD)"
+            echo "runner_image=${ImageOS:-?} ${ImageVersion:-?}"
+            echo "kernel=$(uname -r)"
+            echo "nproc=$(nproc)"
+            echo "cpu=$(lscpu | sed -n 's/^Model name: *//p')"
+            echo "stress_ng=$(stress-ng --version 2>&1 | head -1)"
+          } | tee "$OUT_DIR/stand.txt"
+
+      - name: Toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal
+          rustc -vV | tee -a "$OUT_DIR/stand.txt"
+
+      - name: Build C0 (baseline) and C1 (rewrite)
+        run: |
+          bash "$HARNESS/build-arm.sh" C0-baseline "$C0_SHA" warpgate-protocol-rdp warpgate_protocol_rdp \
+            warpgate-protocol-rdp "$M1_TEST" warpgate-protocol-rdp/src/server/hold_screen.rs \
+            'pump stopped draining before it reached the disconnect' 0
+          bash "$HARNESS/build-arm.sh" C1-rewrite "$C1_SHA" warpgate-protocol-rdp warpgate_protocol_rdp \
+            warpgate-protocol-rdp "$M1_TEST" warpgate-protocol-rdp/src/server/hold_screen.rs \
+            'pump stopped draining before it reached the disconnect' 1
+
+      - name: M1 idle (600 per arm, interleaved)
+        env:
+          MEASUREMENT: M1
+          CONDITION: idle
+        run: |
+          if pgrep -x stress-ng > /dev/null; then echo "::error::stress-ng is running in the idle cell"; exit 1; fi
+          N_PER_ARM=$M1_N_PER_ARM TEST_NAME=$M1_TEST \
+          ARM_A=$ARMS_DIR/C0-baseline/arm.env ARM_B=$ARMS_DIR/C1-rewrite/arm.env \
+            bash "$HARNESS/run-interleaved.sh"
+
+      - name: M1 stressed (600 per arm, interleaved)
+        env:
+          MEASUREMENT: M1
+          CONDITION: stressed
+        run: |
+          source "$HARNESS/stress.sh"
+          stress_start "$OUT_DIR"
+          N_PER_ARM=$M1_N_PER_ARM TEST_NAME=$M1_TEST \
+          ARM_A=$ARMS_DIR/C0-baseline/arm.env ARM_B=$ARMS_DIR/C1-rewrite/arm.env \
+            bash "$HARNESS/run-interleaved.sh"
+          stress_alive || { echo "::error::stress-ng is gone at the end of the stressed cell"; exit 1; }
+          echo "loadavg_at_end=$(cat /proc/loadavg)" | tee -a "$OUT_DIR/stress.meta"
+
+      - name: Collect arm records
+        if: always()
+        run: |
+          mkdir -p "$OUT_DIR/arms"
+          for arm in "$ARMS_DIR"/*/; do
+            name=$(basename "$arm")
+            mkdir -p "$OUT_DIR/arms/$name"
+            cp "$arm"/arm.env "$arm"/build.log "$arm"/executables.txt "$OUT_DIR/arms/$name/" 2> /dev/null || true
+          done
+
+      - uses: actions/upload-artifact@2848b2cda0e5190984587ec6bb1f36730ca78d50
+        if: always()
+        with:
+          name: m1-raw
+          path: ${{ runner.temp }}/out/m1
+          if-no-files-found: warn
+
+  m2-images:
+    name: M2 resolve the fixture's images to digests
+    needs: guard
+    runs-on: ubuntu-24.04
+    outputs:
+      vault_ref: ${{ steps.resolve.outputs.vault_ref }}
+      openbao_ref: ${{ steps.resolve.outputs.openbao_ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Resolve once, so every shard runs the same bytes
+        id: resolve
+        run: |
+          python3 "$HARNESS/m2_vault_ca.py" --print-images > images.txt
+          cat images.txt
+          vault_tag=$(sed -n 's/^vault=//p' images.txt)
+          openbao_tag=$(sed -n 's/^openbao=//p' images.txt)
+          # The fixture's own pin, never a floating tag.
+          if [[ "${openbao_tag##*/}" != *:* || "$openbao_tag" == *:latest ]]; then
+            echo "::error::OpenBao is not pinned to a version: $openbao_tag"
+            exit 1
+          fi
+          for pair in "vault:$vault_tag" "openbao:$openbao_tag"; do
+            engine=${pair%%:*} tag=${pair#*:}
+            docker pull "$tag" > /dev/null
+            repo=${tag%:*}
+            ref=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$tag" | grep "^$repo@sha256:" | head -1)
+            [ -n "$ref" ] || { echo "::error::no digest for $tag"; exit 1; }
+            echo "$engine: $tag -> $ref"
+            echo "${engine}_ref=$ref" >> "$GITHUB_OUTPUT"
+          done
+
+  m2:
+    name: M2 (D1) config/ca timing, shard ${{ matrix.shard }}
+    needs: m2-images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every shard runs 25 trials of all four cells in rotating order; a cell
+        # is never confined to one runner.
+        shard: [0, 1, 2, 3]
+    env:
+      VAULT_REF: ${{ needs.m2-images.outputs.vault_ref }}
+      OPENBAO_REF: ${{ needs.m2-images.outputs.openbao_ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: The fixture is C3's
+        run: |
+          mkdir -p "$RUNNER_TEMP/out/m2"
+          git diff --quiet "$C3_SHA" HEAD -- tests/ || { echo "::error::tests/ differs from C3"; exit 1; }
+          count=$(grep -cE 'config/ca", \{"generate_signing_key": True\}, timeout=60' tests/vault_server.py || true)
+          echo "fixture fingerprint (config/ca timeout=60): $count"
+          [ "$count" = 1 ] || { echo "::error::tests/vault_server.py is not the C3 fixture"; exit 1; }
+          {
+            echo "workflow_sha=$(git rev-parse HEAD)"
+            echo "fixture_sha256=$(sha256sum tests/vault_server.py | cut -d' ' -f1)"
+            echo "runner_image=${ImageOS:-?} ${ImageVersion:-?}"
+            echo "kernel=$(uname -r)"
+            echo "nproc=$(nproc)"
+            echo "cpu=$(lscpu | sed -n 's/^Model name: *//p')"
+            echo "docker=$(docker version --format '{{.Server.Version}}')"
+            echo "python=$(python3 --version)"
+            echo "vault_ref=$VAULT_REF"
+            echo "openbao_ref=$OPENBAO_REF"
+          } | tee "$RUNNER_TEMP/out/m2/stand-shard-${{ matrix.shard }}.txt"
+
+      - name: Python environment for the fixture
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet requests==2.32.3 pyyaml==6.0.2
+
+      - name: Pull both images by digest (before any timing)
+        run: |
+          for ref in "$VAULT_REF" "$OPENBAO_REF"; do
+            case "$ref" in *@sha256:*) ;; *) echo "::error::not a digest: $ref"; exit 1 ;; esac
+            docker pull "$ref" > /dev/null
+            docker image inspect --format '{{.Id}} {{.RepoDigests}}' "$ref"
+          done
+
+      - name: M2 trials (25 per cell, rotating order)
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" "$HARNESS/m2_vault_ca.py" \
+            --shard ${{ matrix.shard }} --shards "$M2_SHARDS" --per-cell "$M2_PER_CELL_PER_SHARD" \
+            --vault-ref "$VAULT_REF" --openbao-ref "$OPENBAO_REF" \
+            --source-sha "$(git rev-parse HEAD)" \
+            --out "$RUNNER_TEMP/out/m2/m2-rows-shard-${{ matrix.shard }}.csv" \
+            2>&1 | tee "$RUNNER_TEMP/out/m2/m2-shard-${{ matrix.shard }}.log"
+
+      - uses: actions/upload-artifact@2848b2cda0e5190984587ec6bb1f36730ca78d50
+        if: always()
+        with:
+          name: m2-raw-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/out/m2
+          if-no-files-found: warn
+
+  m3:
+    name: M3 (D2) oversized-body test, controls then C0 vs C2 stressed
+    needs: guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: false
+          large-packages: false
+          docker-images: false
+
+      - name: Paths
+        run: |
+          echo "ARMS_DIR=$RUNNER_TEMP/arms" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/target" >> "$GITHUB_ENV"
+          echo "OUT_DIR=$RUNNER_TEMP/out/m3" >> "$GITHUB_ENV"
+
+      - name: Install stress-ng and record the stand (before any timing)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y stress-ng
+          mkdir -p "$OUT_DIR"
+          {
+            echo "workflow_sha=$(git rev-parse HEAD)"
+            echo "runner_image=${ImageOS:-?} ${ImageVersion:-?}"
+            echo "kernel=$(uname -r)"
+            echo "nproc=$(nproc)"
+            echo "cpu=$(lscpu | sed -n 's/^Model name: *//p')"
+            echo "stress_ng=$(stress-ng --version 2>&1 | head -1)"
+          } | tee "$OUT_DIR/stand.txt"
+
+      - name: Toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal
+          rustc -vV | tee -a "$OUT_DIR/stand.txt"
+
+      - name: Build C0 (baseline, the exact head) and C2 (candidate stub)
+        run: |
+          bash "$HARNESS/build-arm.sh" C0-baseline "$C0_SHA" warpgate-vault warpgate_vault \
+            warpgate-vault "$M3_TEST" warpgate-vault/src/client.rs 'fn spawn_sign_body_server' 0
+          bash "$HARNESS/build-arm.sh" C2-fix "$C2_SHA" warpgate-vault warpgate_vault \
+            warpgate-vault "$M3_TEST" warpgate-vault/src/client.rs 'fn spawn_sign_body_server' 1
+
+      # The acceptance evidence, and a gate: if any of these fails there is no
+      # point spending the rate trials.
+      - name: Deterministic controls on C2
+        run: |
+          source "$ARMS_DIR/C2-fix/arm.env"
+          mkdir -p "$OUT_DIR/controls"
+          run_control() {
+            local name=$1 test=$2
+            (cd "$ARM_CWD" && timeout 300 "$ARM_BIN" --exact "$test" --test-threads=1 --nocapture) \
+              > "$OUT_DIR/controls/$name.log" 2>&1
+            local code=$?
+            echo "$name: exit $code (binary $ARM_BIN_SHA256, source $ARM_SHA)"
+            cat "$OUT_DIR/controls/$name.log"
+            [ "$code" -eq 0 ] && grep -q '^test result: ok\. 1 passed' "$OUT_DIR/controls/$name.log"
+          }
+          set +e
+          run_control positive "$M3_TEST"; positive=$?
+          run_control negative-control "$M3_NEGATIVE_CONTROL"; negative=$?
+          run_control negative-proof "$M3_NEGATIVE_PROOF"; proof=$?
+          set -e
+          # The proof passes only by panicking with the strict assertion's own
+          # message on a truncated body; a panic from anywhere else is not it.
+          grep -q 'expected the body to be refused on size, got Request' "$OUT_DIR/controls/negative-proof.log" || proof=1
+          echo "positive=$positive negative_control=$negative negative_proof=$proof" | tee "$OUT_DIR/controls/summary.txt"
+          [ "$positive" -eq 0 ] && [ "$negative" -eq 0 ] && [ "$proof" -eq 0 ]
+
+      - name: M3 stressed (1000 per arm, interleaved)
+        env:
+          MEASUREMENT: M3
+          CONDITION: stressed
+        run: |
+          source "$HARNESS/stress.sh"
+          stress_start "$OUT_DIR"
+          N_PER_ARM=$M3_N_PER_ARM TEST_NAME=$M3_TEST \
+          ARM_A=$ARMS_DIR/C0-baseline/arm.env ARM_B=$ARMS_DIR/C2-fix/arm.env \
+            bash "$HARNESS/run-interleaved.sh"
+          stress_alive || { echo "::error::stress-ng is gone at the end of the stressed cell"; exit 1; }
+          echo "loadavg_at_end=$(cat /proc/loadavg)" | tee -a "$OUT_DIR/stress.meta"
+
+      - name: Collect arm records
+        if: always()
+        run: |
+          mkdir -p "$OUT_DIR/arms"
+          for arm in "$ARMS_DIR"/*/; do
+            name=$(basename "$arm")
+            mkdir -p "$OUT_DIR/arms/$name"
+            cp "$arm"/arm.env "$arm"/build.log "$arm"/executables.txt "$OUT_DIR/arms/$name/" 2> /dev/null || true
+          done
+
+      - uses: actions/upload-artifact@2848b2cda0e5190984587ec6bb1f36730ca78d50
+        if: always()
+        with:
+          name: m3-raw
+          path: ${{ runner.temp }}/out/m3
+          if-no-files-found: warn
+
+  report:
+    name: Report
+    needs: [guard, m1, m2, m3]
+    if: always() && needs.guard.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          path: ${{ runner.temp }}/artifacts
+
+      - name: Summarise
+        run: |
+          set +e
+          python3 "$HARNESS/report.py" "$RUNNER_TEMP/artifacts" "$RUNNER_TEMP/report"
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/report/report.md" >> "$GITHUB_STEP_SUMMARY" || true
+          exit "$status"
+
+      - uses: actions/upload-artifact@2848b2cda0e5190984587ec6bb1f36730ca78d50
+        if: always()
+        with:
+          name: report
+          path: ${{ runner.temp }}/report
+          if-no-files-found: warn
