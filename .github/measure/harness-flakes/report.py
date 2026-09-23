@@ -17,11 +17,20 @@ Methods, written down so no reader has to guess them:
   p-value are the result in that case.
 * M1 and M3 are secondary to the deterministic controls: a zero baseline is
   reported as INCONCLUSIVE, never as "no defect".
+* M1 and M3 outcomes: only the predeclared defect class of each measurement is
+  a failure. Every other non-pass (watchdog kill, zero tests matched, binary
+  mismatch, any other panic) is invalid: it is listed under the problems, it
+  never enters k, n, Wilson, Fisher or the rate ratio, and it fails the report.
+  Each arm must have exactly the predeclared number of valid rows, split evenly
+  between the batches it ran first and second.
 * M2: median and p95 (nearest rank: the ceil(0.95 n)-th smallest) and the ECDF
   are over uncensored completions only, and the censored count is reported
   beside them; with any censored row those statistics are conditional on
   completion and biased low. Duration > 10 s counts censored rows as > 10 s.
-  No p99 or sub-1 % claim is made from 100 trials.
+  No p99 or sub-1 % claim is made from 100 trials. Every cell must have exactly
+  100 ok-or-censored rows, 25 from each shard; an error row is a problem, not a
+  smaller denominator. A cell must show one image ID, one server version and
+  one fixture hash.
 * Load conditions are reported separately and never pooled.
 
 usage: report.py ARTIFACT_DIR OUT_DIR
@@ -38,8 +47,16 @@ from pathlib import Path
 Z = 1.959963984540054
 
 # The predeclared design. A cell with any other row count fails the report.
-M1 = {"arms": ("C0-baseline", "C1-rewrite"), "conditions": ("idle", "stressed"), "n": 600}
-M3 = {"arms": ("C0-baseline", "C2-fix"), "conditions": ("stressed",), "n": 1000}
+# `defect` is the one class that counts as a failure, keyed by the assertion
+# message it fired on; the arms of each pair share that message in source.
+M1 = {
+    "arms": ("C0-baseline", "C1-rewrite"), "conditions": ("idle", "stressed"), "n": 600,
+    "defect": "events_left_on_channel",
+}
+M3 = {
+    "arms": ("C0-baseline", "C2-fix"), "conditions": ("stressed",), "n": 1000,
+    "defect": "not_refused_on_size",
+}
 M2 = {
     "cells": [("vault", "default"), ("vault", "ed25519"), ("openbao", "default"), ("openbao", "ed25519")],
     "n": 100,
@@ -100,37 +117,56 @@ def arm_section(name: str, spec: dict, rows: list[dict], problems: list[str], ou
         "rates are per-invocation rates.\n"
     )
     base, treat = spec["arms"]
+    defect = spec["defect"]
     for condition in spec["conditions"]:
         out.append(f"### {name} — {condition}\n")
-        out.append("| arm | source | binary sha256 | n | failures | rate | Wilson 95% | failure classes |")
+        out.append(
+            f"Failure = `{defect}` only. n counts valid rows (pass or `{defect}`); invalid rows are listed apart.\n"
+        )
+        out.append("| arm | source | binary sha256 | n | failures | rate | Wilson 95% | invalid (class: count) |")
         out.append("|---|---|---|---|---|---|---|---|")
         counts = {}
+        problems_before = len(problems)
         for arm in (base, treat):
             sel = [r for r in rows if r["condition"] == condition and r["arm"] == arm]
-            n = len(sel)
-            k = sum(r["outcome"] == "fail" for r in sel)
+            valid, invalid = [], []
+            for r in sel:
+                admissible = r["outcome"] == "pass" or (r["outcome"] == "fail" and r["class"] == defect)
+                (valid if admissible else invalid).append(r)
+            n = len(valid)
+            k = sum(r["outcome"] == "fail" for r in valid)
             if n != spec["n"]:
-                problems.append(f"{name}/{condition}/{arm}: {n} rows, predeclared {spec['n']}")
+                problems.append(f"{name}/{condition}/{arm}: {n} valid rows, predeclared {spec['n']}")
+            invalid_classes = {}
+            for r in invalid:
+                label = f"{r['outcome']}/{r['class']}"
+                invalid_classes[label] = invalid_classes.get(label, 0) + 1
+            if invalid_classes:
+                problems.append(f"{name}/{condition}/{arm}: invalid rows {invalid_classes}")
+            for order in ("AB", "BA"):
+                per = sum(r.get("batch_order") == order for r in sel)
+                if per != spec["n"] // 2:
+                    problems.append(
+                        f"{name}/{condition}/{arm}: {per} rows in {order} batches, predeclared {spec['n'] // 2}"
+                    )
             shas = sorted({r["source_sha"] for r in sel}) or ["-"]
             bins = sorted({r["binary_sha256"] for r in sel}) or ["-"]
             if len(shas) > 1 or len(bins) > 1:
                 problems.append(f"{name}/{condition}/{arm}: more than one source or binary in one arm")
-            classes = {}
-            for r in sel:
-                if r["outcome"] == "fail":
-                    classes[r["class"]] = classes.get(r["class"], 0) + 1
             lo, hi = wilson(k, n)
             out.append(
                 f"| {arm} | `{shas[0][:12]}` | `{bins[0][:16]}` | {n} | {k} | "
-                f"{pct(k / n) if n else '-'} | {pct(lo)} to {pct(hi)} | {classes or '-'} |"
+                f"{pct(k / n) if n else '-'} | {pct(lo)} to {pct(hi)} | {invalid_classes or '-'} |"
             )
             counts[arm] = (k, n)
             data.setdefault(name, {}).setdefault(condition, {})[arm] = {
-                "n": n, "failures": k, "wilson95": [lo, hi], "classes": classes,
-                "source_sha": shas, "binary_sha256": bins,
+                "n": n, "failures": k, "wilson95": [lo, hi], "defect_class": defect,
+                "invalid": invalid_classes, "source_sha": shas, "binary_sha256": bins,
             }
         (kb, nb), (kt, nt) = counts[base], counts[treat]
-        if nb and nt:
+        if len(problems) > problems_before:
+            out.append("\n**Comparison withheld**: this condition has problems (see the checks below).")
+        elif nb and nt:
             p = fisher_two_sided(kb, nb - kb, kt, nt - kt)
             rr = rate_ratio(kb, nb, kt, nt)
             out.append("")
@@ -165,17 +201,29 @@ def m2_section(rows: list[dict], problems: list[str], out: list[str], data: dict
     for engine, key_cell in M2["cells"]:
         sel = [r for r in rows if r["engine"] == engine and r["key_cell"] == key_cell]
         n = len(sel)
-        if n != M2["n"]:
-            problems.append(f"M2/{engine}/{key_cell}: {n} rows, predeclared {M2['n']}")
-        for shard in range(M2["shards"]):
-            per = sum(1 for r in sel if r["shard"] == str(shard))
-            if per != M2["n"] // M2["shards"]:
-                problems.append(f"M2/{engine}/{key_cell}/shard {shard}: {per} rows, predeclared {M2['n'] // M2['shards']}")
+        cell = f"M2/{engine}/{key_cell}"
+        is_valid = [r["config_ca_status"] in ("ok", "censored") for r in sel]
         ok = [float(r["config_ca_s"]) for r in sel if r["config_ca_status"] == "ok"]
         censored = sum(r["config_ca_status"] == "censored" for r in sel)
-        errors = sum(r["config_ca_status"] not in ("ok", "censored") for r in sel)
+        errors = sum(not v for v in is_valid)
         over = sum(v > M2["budget_s"] for v in ok) + censored
         valid = len(ok) + censored
+        if valid != M2["n"]:
+            problems.append(f"{cell}: {valid} ok+censored rows ({n} rows, {errors} error), predeclared {M2['n']}")
+        per_shard = M2["n"] // M2["shards"]
+        for shard in range(M2["shards"]):
+            per = sum(1 for r, v in zip(sel, is_valid) if v and r["shard"] == str(shard))
+            if per != per_shard:
+                problems.append(f"{cell}/shard {shard}: {per} ok+censored rows, predeclared {per_shard}")
+        if errors:
+            reasons = sorted({r["error"].split(":", 1)[0] for r, v in zip(sel, is_valid) if not v})
+            problems.append(f"{cell}: {errors} error rows ({', '.join(reasons)})")
+        for field in ("image_ref", "image_id", "server_version", "fixture_sha256"):
+            # Over the valid rows, where each field is always filled; an empty
+            # value there is a provenance gap and counts as a distinct value.
+            seen = sorted({r.get(field, "") for r, v in zip(sel, is_valid) if v})
+            if len(seen) > 1 or seen == [""]:
+                problems.append(f"{cell}: {field} is not one value: {seen}")
         lo, hi = wilson(over, valid)
         keys = {}
         for r in sel:
@@ -186,8 +234,6 @@ def m2_section(rows: list[dict], problems: list[str], out: list[str], data: dict
         health_censored = sum(r["health_censored"] == "True" for r in sel)
         images = sorted({r["image_ref"] for r in sel}) or ["-"]
         versions = sorted({r["server_version"] for r in sel if r["server_version"]}) or ["-"]
-        if len(images) > 1:
-            problems.append(f"M2/{engine}/{key_cell}: more than one image in one cell: {images}")
 
         def stats(values):
             if not values:
@@ -238,7 +284,9 @@ def main() -> int:
     m2_section(m2, problems, out, data, out_dir)
 
     out.append("## Row-count and provenance checks\n")
-    out.extend(f"- FAIL: {p}" for p in problems) if problems else out.append("- every cell has its predeclared row count")
+    out.extend(f"- FAIL: {p}" for p in problems) if problems else out.append(
+        "- every cell has its predeclared valid row count, no invalid rows and one provenance"
+    )
     data["problems"] = problems
 
     (out_dir / "report.md").write_text("\n".join(out) + "\n")

@@ -14,15 +14,20 @@
 #
 # M1 and M3 trials are independent invocations of the arm's test binary, one
 # process per trial, so their rates are per-invocation rates. Baseline and
-# treatment always run in the same job, interleaved in batches of 50.
+# treatment always run in the same job, interleaved in batches of 50, A first on
+# even batches and B first on odd ones. Only each measurement's predeclared
+# defect class counts as a failure; any other non-pass is invalid and fails the
+# report instead of entering a rate.
 #
-# Dispatch only, and only on measure/harness-flakes, so pushing this file cannot
-# start it.
+# Started by a push to measure/harness-flakes: workflow_dispatch only sees
+# workflows on the default branch, which this one never reaches. Each push is a
+# new workflow commit and so a separate experiment; runs are never pooled.
 
 name: Measure harness flakes (fork-only)
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [measure/harness-flakes]
 
 permissions:
   contents: read
@@ -51,6 +56,10 @@ env:
   M3_TEST: client::tests::test_an_oversized_success_body_is_refused_rather_than_buffered
   M3_NEGATIVE_CONTROL: client::tests::a_body_cut_short_below_the_limit_is_a_transport_error
   M3_NEGATIVE_PROOF: client::tests::the_size_assertion_rejects_a_truncated_body
+  # The only outcome class that counts as a failure, by the assertion message
+  # both arms of the pair carry in source (see run-interleaved.sh classify).
+  M1_DEFECT_CLASS: events_left_on_channel
+  M3_DEFECT_CLASS: not_refused_on_size
   HARNESS: .github/measure/harness-flakes
   CARGO_TERM_COLOR: never
 
@@ -153,7 +162,7 @@ jobs:
           CONDITION: idle
         run: |
           if pgrep -x stress-ng > /dev/null; then echo "::error::stress-ng is running in the idle cell"; exit 1; fi
-          N_PER_ARM=$M1_N_PER_ARM TEST_NAME=$M1_TEST \
+          N_PER_ARM=$M1_N_PER_ARM TEST_NAME=$M1_TEST DEFECT_CLASS=$M1_DEFECT_CLASS \
           ARM_A=$ARMS_DIR/C0-baseline/arm.env ARM_B=$ARMS_DIR/C1-rewrite/arm.env \
             bash "$HARNESS/run-interleaved.sh"
 
@@ -164,7 +173,7 @@ jobs:
         run: |
           source "$HARNESS/stress.sh"
           stress_start "$OUT_DIR"
-          N_PER_ARM=$M1_N_PER_ARM TEST_NAME=$M1_TEST \
+          N_PER_ARM=$M1_N_PER_ARM TEST_NAME=$M1_TEST DEFECT_CLASS=$M1_DEFECT_CLASS \
           ARM_A=$ARMS_DIR/C0-baseline/arm.env ARM_B=$ARMS_DIR/C1-rewrite/arm.env \
             bash "$HARNESS/run-interleaved.sh"
           stress_alive || { echo "::error::stress-ng is gone at the end of the stressed cell"; exit 1; }
@@ -271,6 +280,13 @@ jobs:
             docker image inspect --format '{{.Id}} {{.RepoDigests}}' "$ref"
           done
 
+      # The config/ca ceiling is a SIGALRM wall deadline; prove it bounds a
+      # server that never answers on this runner's Python before trusting it.
+      - name: Wall-deadline self-test (before any timing)
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" "$HARNESS/m2_vault_ca.py" --self-test-wall-deadline \
+            2>&1 | tee "$RUNNER_TEMP/out/m2/wall-deadline-self-test-shard-${{ matrix.shard }}.txt"
+
       - name: M2 trials (25 per cell, rotating order)
         run: |
           "$RUNNER_TEMP/venv/bin/python" "$HARNESS/m2_vault_ca.py" \
@@ -370,7 +386,7 @@ jobs:
         run: |
           source "$HARNESS/stress.sh"
           stress_start "$OUT_DIR"
-          N_PER_ARM=$M3_N_PER_ARM TEST_NAME=$M3_TEST \
+          N_PER_ARM=$M3_N_PER_ARM TEST_NAME=$M3_TEST DEFECT_CLASS=$M3_DEFECT_CLASS \
           ARM_A=$ARMS_DIR/C0-baseline/arm.env ARM_B=$ARMS_DIR/C2-fix/arm.env \
             bash "$HARNESS/run-interleaved.sh"
           stress_alive || { echo "::error::stress-ng is gone at the end of the stressed cell"; exit 1; }

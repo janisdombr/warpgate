@@ -7,9 +7,13 @@ readiness wait, to time it separately and at a finer poll, and `_configure`,
 which stops after the timed `config/ca` call instead of building the role and
 AppRole the tests need.
 
-The measurement ceiling is 120 s, twice the fixture's new 60 s budget. A call
-that reaches it is right-censored: the row says `censored` and its duration is a
-lower bound, never a completion time.
+The measurement ceiling is 120 s, twice the fixture's new 60 s budget, and it
+is a wall-clock ceiling on the whole call. urllib's `timeout` bounds each socket
+operation, not the call, so connect, TLS, headers and body could each take up to
+it and the sum still come back `ok`; a SIGALRM interval timer bounds the sum. A
+call that reaches the ceiling by any route is right-censored: the row says
+`censored`, `censor_reason` says which route, and the duration is a lower bound,
+never a completion time.
 
 Cells: {vault, openbao} x {default, ed25519}. `default` sends no key_type, as
 the fixture does; `ed25519` is a control that asks for an Ed25519 CA. The key
@@ -17,6 +21,7 @@ the server actually generated is read back and recorded for every trial, so the
 default's type and size are observed, not assumed.
 
     python3 m2_vault_ca.py --print-images
+    python3 m2_vault_ca.py --self-test-wall-deadline
     python3 m2_vault_ca.py --shard K --shards 4 --per-cell 25 \
         --vault-ref REF --openbao-ref REF --source-sha SHA --out rows.csv
 """
@@ -26,17 +31,23 @@ import ast
 import csv
 import datetime
 import hashlib
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
+import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 FIXTURE = REPO / "tests" / "vault_server.py"
 
 CEILING_S = 120.0
+# Never above the wall ceiling, so a socket timeout cannot outlast it.
+SOCKET_TIMEOUT_S = CEILING_S
 HEALTH_CEILING_S = 120.0
 HEALTH_POLL_S = 0.1
 
@@ -55,7 +66,7 @@ FIELDS = [
     "measurement", "shard", "round", "position", "engine", "key_cell",
     "image_ref", "image_id", "source_sha", "fixture_sha256", "started_utc",
     "launch_s", "health_ready_s", "health_censored", "server_version",
-    "config_ca_s", "config_ca_status", "ceiling_s", "ca_key_type", "ca_key_bits",
+    "config_ca_s", "config_ca_status", "censor_reason", "ceiling_s", "ca_key_type", "ca_key_bits",
     "error",
 ]
 
@@ -86,6 +97,52 @@ def one_line(error: BaseException) -> str:
 
 class HealthTimeout(Exception):
     pass
+
+
+class WallDeadline(BaseException):
+    """Raised from SIGALRM. A BaseException, so neither urllib (which rewraps
+    OSError) nor a broad `except Exception` in the fixture can swallow it."""
+
+
+def _on_alarm(signum, frame):
+    raise WallDeadline
+
+
+def timed_call(call, ceiling_s: float) -> tuple[str, str, float, BaseException | None]:
+    """Runs `call` under a hard wall deadline; returns (status, censor_reason,
+    elapsed_s, error). Status is `ok`, `censored` or `error`.
+
+    The timer is one-shot, so if it fires inside the inner `finally` before the
+    disarm it is already spent; the handler is restored on every path.
+    """
+    previous = signal.signal(signal.SIGALRM, _on_alarm)
+    fired = False
+    error = None
+    t0 = time.monotonic()
+    try:
+        try:
+            signal.setitimer(signal.ITIMER_REAL, ceiling_s)
+            call()
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+    except WallDeadline:
+        fired = True
+    except Exception as caught:
+        error = caught
+    finally:
+        signal.signal(signal.SIGALRM, previous)
+    elapsed = time.monotonic() - t0
+
+    if fired:
+        return "censored", "wall_deadline", elapsed, None
+    if error is not None and is_timeout(error):
+        return "censored", "socket_timeout", elapsed, error
+    # At or past the ceiling is never a completion time, whatever ended it.
+    if elapsed >= ceiling_s:
+        return "censored", "elapsed_at_ceiling", elapsed, error
+    if error is not None:
+        return "error", "", elapsed, error
+    return "ok", "", elapsed, None
 
 
 def measured_vault_class():
@@ -135,19 +192,19 @@ def measured_vault_class():
             self._api("POST", "sys/mounts/" + MOUNT, {"type": "ssh"})
 
             self.row["ceiling_s"] = CEILING_S
-            t0 = time.monotonic()
-            try:
-                self._api("POST", f"{MOUNT}/config/ca", PAYLOAD[self.key_cell], timeout=CEILING_S)
-            except Exception as error:
-                self.row["config_ca_s"] = round(time.monotonic() - t0, 3)
-                if is_timeout(error):
-                    self.row["config_ca_status"] = "censored"
-                    return
-                self.row["config_ca_status"] = "error"
+            status, reason, elapsed, error = timed_call(
+                lambda: self._api(
+                    "POST", f"{MOUNT}/config/ca", PAYLOAD[self.key_cell], timeout=SOCKET_TIMEOUT_S
+                ),
+                CEILING_S,
+            )
+            self.row["config_ca_s"] = round(elapsed, 3)
+            self.row["config_ca_status"] = status
+            self.row["censor_reason"] = reason
+            if status == "error":
                 self.row["error"] = "config/ca: " + one_line(error)
+            if status != "ok":
                 return
-            self.row["config_ca_s"] = round(time.monotonic() - t0, 3)
-            self.row["config_ca_status"] = "ok"
 
             key = self.ca_public_key
             self.row["ca_key_type"] = key.split(" ", 1)[0]
@@ -172,9 +229,87 @@ def image_id(ref: str) -> str:
     return out.stdout.strip()
 
 
+def self_test_wall_deadline() -> int:
+    """Proves the ceiling holds against servers that never finish answering,
+    with the ceiling lowered to 2 s. Local sockets only; no Docker."""
+    ceiling = 2.0
+
+    def serve(behaviour):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        held = []
+
+        def run():
+            while True:
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                held.append(conn)
+                behaviour(conn)
+
+        threading.Thread(target=run, daemon=True).start()
+        return listener, f"http://127.0.0.1:{listener.getsockname()[1]}/v1/ssh/config/ca"
+
+    def silent(conn):
+        pass
+
+    def trickle(conn):
+        # One header byte every 0.5 s: no single socket read ever waits long
+        # enough to time out, so only the wall deadline can end the call.
+        def run():
+            try:
+                conn.sendall(b"HTTP/1.1 200 OK\r\n")
+                while True:
+                    time.sleep(0.5)
+                    conn.sendall(b"X")
+            except OSError:
+                return
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def answers(conn):
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+        conn.close()
+
+    cases = [
+        ("silent server, socket timeout = ceiling", silent, ceiling, "censored"),
+        ("silent server, socket timeout 30 s > ceiling", silent, 30.0, "censored"),
+        ("trickling server, socket timeout = ceiling", trickle, ceiling, "censored"),
+        ("answering server", answers, ceiling, "ok"),
+    ]
+    failed = 0
+    for name, behaviour, socket_timeout, want in cases:
+        listener, url = serve(behaviour)
+        request = urllib.request.Request(url, method="POST", data=b"{}")
+
+        def call():
+            with urllib.request.urlopen(request, timeout=socket_timeout) as response:
+                response.read()
+
+        status, reason, elapsed, error = timed_call(call, ceiling)
+        listener.close()
+        disarmed = signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+        restored = signal.getsignal(signal.SIGALRM) is signal.SIG_DFL
+        within = elapsed < ceiling + 1.0
+        good = status == want and disarmed and restored and within
+        failed += not good
+        print(
+            f"{'PASS' if good else 'FAIL'}: {name}: status={status} reason={reason or '-'} "
+            f"elapsed={elapsed:.3f}s ceiling={ceiling}s timer_disarmed={disarmed} "
+            f"handler_restored={restored} error={one_line(error) if error else '-'}",
+            flush=True,
+        )
+    print(f"self-test: {len(cases) - failed}/{len(cases)} passed")
+    return 1 if failed else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--print-images", action="store_true")
+    parser.add_argument("--self-test-wall-deadline", action="store_true")
     parser.add_argument("--shard", type=int)
     parser.add_argument("--shards", type=int)
     parser.add_argument("--per-cell", type=int)
@@ -183,6 +318,9 @@ def main() -> int:
     parser.add_argument("--source-sha")
     parser.add_argument("--out")
     args = parser.parse_args()
+
+    if args.self_test_wall_deadline:
+        return self_test_wall_deadline()
 
     if args.print_images:
         images = fixture_images()
@@ -238,7 +376,7 @@ def main() -> int:
                 print(
                     f"shard {args.shard} round {rnd} {engine}/{key_cell}: "
                     f"health {row['health_ready_s']} s, config/ca {row['config_ca_s']} s "
-                    f"[{row['config_ca_status']}] {row['ca_key_type']} {row['ca_key_bits']} {row['error']}",
+                    f"[{row['config_ca_status']}{' ' + row['censor_reason'] if row['censor_reason'] else ''}] {row['ca_key_type']} {row['ca_key_bits']} {row['error']}",
                     flush=True,
                 )
 
