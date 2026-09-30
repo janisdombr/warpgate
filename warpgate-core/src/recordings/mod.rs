@@ -304,3 +304,7 @@ impl SessionRecordings {
         Ok(self.storage().await?.access(recording, file))
     }
 }
+
+#[cfg(test)]
+#[cfg(feature = "sqlite")]
+mod tests;
