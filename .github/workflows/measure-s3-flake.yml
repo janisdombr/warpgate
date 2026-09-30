@@ -1,0 +1,139 @@
+# Fork-only measurement of tests/test_recordings_s3.py::Test::test_s3_recording_roundtrip.
+# Never part of an upstream PR, never merged into the fix branch.
+#
+# Predeclared: BEFORE (upstream main) vs AFTER (the fix, its child), N runs per
+# arm, interleaved ABAB on one runner against the same S3 image, each run a
+# fresh pytest process with a fresh S3 container. Only the CI symptom
+# ("no recording object in bucket") counts as a failure; any other non-pass is
+# counted as OTHER and reported separately, never pooled into the rate.
+
+name: Measure S3 recording flake (fork-only)
+
+on:
+  push:
+    branches: [measure/s3-flake]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: measure-s3-flake
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  BEFORE_SHA: 32f824ee3abccbf27ad84cfda777b739379962b8
+  AFTER_SHA: 451c52381d7937e6b86f2102553408fdff025d69
+  N_PER_ARM: 50
+  TEST_ID: test_recordings_s3.py::Test::test_s3_recording_roundtrip
+  CARGO_TERM_COLOR: never
+
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Refuse any ref but the measurement branch
+        run: |
+          [ "$GITHUB_REF" = refs/heads/measure/s3-flake ] || { echo "::error::wrong ref $GITHUB_REF"; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Arms are what they claim to be
+        run: |
+          git fetch -q https://github.com/warp-tech/warpgate "$BEFORE_SHA" || true
+          [ "$(git rev-parse "$AFTER_SHA^")" = "$BEFORE_SHA" ] || { echo "::error::AFTER is not a child of BEFORE"; exit 1; }
+          got=$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" | sort | tr '\n' ' ')
+          want="warpgate-core/src/recordings/mod.rs warpgate-core/src/recordings/storage.rs warpgate-core/src/recordings/writer.rs "
+          echo "BEFORE..AFTER changes: $got"
+          [ "$got" = "$want" ] || { echo "::error::unexpected diff '$got'"; exit 1; }
+          echo "workflow commit: $(git rev-parse HEAD)"
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6
+        with:
+          tool-cache: false
+          large-packages: false
+          docker-images: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-client expect gnome-keyring
+          cargo install --locked just@1.4.0
+          pip3 install keyring==24 poetry==1.8.3
+
+      - name: Build BEFORE
+        run: |
+          git checkout -q "$BEFORE_SHA"
+          git submodule update -q --init --recursive
+          just npm ci
+          just openapi
+          just npm run openapi:tests-sdk
+          just npm run build
+          cargo build --all-features
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp target/debug/warpgate "$RUNNER_TEMP/bin/warpgate-before"
+          echo "before: src=$(git rev-parse HEAD) writer.rs=$(git hash-object warpgate-core/src/recordings/writer.rs) bin=$(sha256sum "$RUNNER_TEMP/bin/warpgate-before" | cut -c1-16)" | tee -a "$RUNNER_TEMP/fingerprints.txt"
+
+      - name: Build AFTER
+        run: |
+          git checkout -q "$AFTER_SHA"
+          cargo build --all-features
+          cp target/debug/warpgate "$RUNNER_TEMP/bin/warpgate-after"
+          echo "after:  src=$(git rev-parse HEAD) writer.rs=$(git hash-object warpgate-core/src/recordings/writer.rs) completion_refs=$(grep -c RecordingCompletion warpgate-core/src/recordings/writer.rs) bin=$(sha256sum "$RUNNER_TEMP/bin/warpgate-after" | cut -c1-16)" | tee -a "$RUNNER_TEMP/fingerprints.txt"
+          cmp -s "$RUNNER_TEMP/bin/warpgate-before" "$RUNNER_TEMP/bin/warpgate-after" && { echo "::error::arms built identical binaries"; exit 1; } || true
+
+      - name: Test deps and images
+        working-directory: tests
+        run: |
+          poetry install
+          make image-ssh-server
+          docker pull chrislusf/seaweedfs
+          echo "s3 image: $(docker image inspect chrislusf/seaweedfs --format '{{index .RepoDigests 0}}')" | tee -a "$RUNNER_TEMP/fingerprints.txt"
+          echo "runner: ${ImageOS:-?} ${ImageVersion:-?} kernel=$(uname -r) nproc=$(nproc)" | tee -a "$RUNNER_TEMP/fingerprints.txt"
+
+      - name: Interleaved runs
+        working-directory: tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/logs"
+          declare -A pass fail other
+          for arm in before after; do pass[$arm]=0; fail[$arm]=0; other[$arm]=0; done
+          for i in $(seq 1 "$N_PER_ARM"); do
+            if [ $((i % 2)) -eq 1 ]; then order="before after"; else order="after before"; fi
+            for arm in $order; do
+              cp "$RUNNER_TEMP/bin/warpgate-$arm" ../target/debug/warpgate
+              log="$RUNNER_TEMP/logs/$arm-$i.log"
+              TIMEOUT=120 timeout 300 poetry run pytest -x -p no:cacheprovider "$TEST_ID" > "$log" 2>&1 || true
+              if grep -q "1 passed" "$log"; then r=pass; pass[$arm]=$((pass[$arm]+1))
+              elif grep -q "no recording object in bucket" "$log"; then r=FAIL; fail[$arm]=$((fail[$arm]+1))
+              else r=OTHER; other[$arm]=$((other[$arm]+1)); fi
+              echo "run $i $arm bin=$(sha256sum ../target/debug/warpgate | cut -c1-16) $r"
+              docker ps -q --filter ancestor=chrislusf/seaweedfs | xargs -r docker rm -f >/dev/null 2>&1 || true
+              sleep 3
+            done
+          done
+          {
+            echo '```'
+            cat "$RUNNER_TEMP/fingerprints.txt"
+            for arm in before after; do
+              echo "RESULT arm=$arm n=$N_PER_ARM pass=${pass[$arm]} fail_no_data_object=${fail[$arm]} other=${other[$arm]}"
+            done
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@2848b2cda0e5190984587ec6bb1f36730ca78d50
+        if: always()
+        with:
+          name: s3-flake-logs
+          path: ${{ runner.temp }}/logs
