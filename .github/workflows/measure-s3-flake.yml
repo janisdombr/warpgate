@@ -25,8 +25,8 @@ defaults:
     shell: bash
 
 env:
-  BEFORE_SHA: 32f824ee3abccbf27ad84cfda777b739379962b8
-  AFTER_SHA: 451c52381d7937e6b86f2102553408fdff025d69
+  BEFORE_SHA: ca1730c7b012fececccbbdcce639313e4599cd74
+  AFTER_SHA: 8d7ae6ec99a60beaf59b4c3981628811a9acf2ad
   N_PER_ARM: 50
   TEST_ID: test_recordings_s3.py::Test::test_s3_recording_roundtrip
   CARGO_TERM_COLOR: never
@@ -50,7 +50,7 @@ jobs:
           git fetch -q https://github.com/warp-tech/warpgate "$BEFORE_SHA" || true
           [ "$(git rev-parse "$AFTER_SHA^")" = "$BEFORE_SHA" ] || { echo "::error::AFTER is not a child of BEFORE"; exit 1; }
           got=$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" | sort | tr '\n' ' ')
-          want="warpgate-core/src/recordings/mod.rs warpgate-core/src/recordings/storage.rs warpgate-core/src/recordings/writer.rs "
+          want="warpgate-aws/src/s3.rs warpgate-core/src/recordings/mod.rs warpgate-core/src/recordings/storage.rs warpgate-core/src/recordings/writer.rs "
           echo "BEFORE..AFTER changes: $got"
           [ "$got" = "$want" ] || { echo "::error::unexpected diff '$got'"; exit 1; }
           echo "workflow commit: $(git rev-parse HEAD)"
