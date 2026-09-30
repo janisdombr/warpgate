@@ -25,8 +25,8 @@ pub use storage::FileAccess;
 use storage::Storage;
 pub use terminal::*;
 pub use traffic::*;
-use writer::WriterShutdown;
 pub use writer::{LiveChunk, NDJsonRecordingWriter, RawRecordingWriter};
+use writer::{RecordingCompletion, WriterShutdown};
 
 /// How long `SessionRecordings::shutdown` waits
 /// (just under kubernetes default)
@@ -110,6 +110,7 @@ pub struct RecordingWriterOpener {
     params: GlobalParams,
     shutdown: CancellationToken,
     shutdown_tracker: TaskTracker,
+    completion: Arc<Mutex<RecordingCompletion>>,
 }
 
 impl RecordingWriterOpener {
@@ -149,6 +150,7 @@ impl RecordingWriterOpener {
                 token: self.shutdown.clone(),
                 tracker: self.shutdown_tracker.clone(),
             },
+            self.completion.clone(),
         )
         .await
     }
@@ -278,6 +280,7 @@ impl SessionRecordings {
             params: self.params.clone(),
             shutdown: self.shutdown.clone(),
             shutdown_tracker: self.shutdown_tracker.clone(),
+            completion: Arc::default(),
         };
 
         T::new(&opener).await
@@ -301,5 +304,99 @@ impl SessionRecordings {
         file: RecordingFile,
     ) -> Result<FileAccess> {
         Ok(self.storage().await?.access(recording, file))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::ActiveValue::Set;
+    use sea_orm::{Database, IntoActiveModel};
+    use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
+    use warpgate_db_migrations::migrate_database;
+
+    use super::*;
+
+    /// A recording made of two files, like a terminal recording's data + index.
+    struct TwoFiles {
+        data: RawRecordingWriter,
+        index: RawRecordingWriter,
+    }
+
+    impl Recorder for TwoFiles {
+        fn kind() -> RecordingKind {
+            RecordingKind::Terminal
+        }
+
+        async fn new(opener: &RecordingWriterOpener) -> Result<Self> {
+            Ok(Self {
+                data: opener.open(RecordingFile::NDJsonData).await?,
+                index: opener.open(RecordingFile::Index).await?,
+            })
+        }
+    }
+
+    async fn wait_for_writers(recordings: &SessionRecordings, remaining: usize) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while recordings.shutdown_tracker.len() != remaining {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn ended(db: &DatabaseConnection) -> Option<OffsetDateTime> {
+        Recording::Entity::find()
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+            .ended
+    }
+
+    /// Readers switch a recording to S3 as soon as it is ended, so a file that
+    /// finishes first must not end it while another is still uploading.
+    #[tokio::test]
+    async fn a_recording_ends_only_after_its_last_file_is_finalized() {
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+        let mut parameters = Parameters::Entity::get(&db)
+            .await
+            .unwrap()
+            .into_active_model();
+        parameters.recordings_enable = Set(true);
+        parameters.update(&db).await.unwrap();
+
+        let root = std::env::temp_dir().join(format!("wg-recordings-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let params = GlobalParams::new(root.join("warpgate.yaml"), false).unwrap();
+        let recordings = SessionRecordings::new(db.clone(), &params);
+
+        let session_id = TargetSessionId(Uuid::new_v4());
+        warpgate_db_entities::TargetSession::ActiveModel {
+            id: Set(session_id),
+            user_session_id: Set(warpgate_common::UserSessionId(Uuid::new_v4())),
+            target_snapshot: Set("{}".into()),
+            target_id: Set(Uuid::new_v4()),
+            started: Set(OffsetDateTime::now_utc()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let recording: TwoFiles = recordings.start(&session_id, None, ()).await.unwrap();
+        wait_for_writers(&recordings, 2).await;
+
+        drop(recording.index);
+        wait_for_writers(&recordings, 1).await;
+        assert_eq!(ended(&db).await, None, "ended while data.ndjson was open");
+
+        drop(recording.data);
+        wait_for_writers(&recordings, 0).await;
+        assert!(ended(&db).await.is_some(), "never ended");
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

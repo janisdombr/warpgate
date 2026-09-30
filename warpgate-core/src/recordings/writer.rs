@@ -6,19 +6,30 @@ use bytes::Bytes;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait};
 use serde::Serialize;
 use time::OffsetDateTime;
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::error;
 use warpgate_common::try_block;
 use warpgate_db_entities::Recording;
 
-use super::storage::RecordingSink;
+use super::storage::{RecordingSink, RecordingSinkCleanupGuard};
 use super::{Error, LiveMap, Result};
 
 pub struct WriterShutdown {
     pub token: CancellationToken,
     pub tracker: TaskTracker,
+}
+
+/// A recording's files (e.g. `data.ndjson` and `index.ndjson`) each finalize in
+/// their own writer task, but `ended` is one flag for all of them and readers
+/// switch to S3 on it. So only the last writer to finish may set it, and every
+/// scratch copy has to outlive it.
+#[derive(Default)]
+pub struct RecordingCompletion {
+    open_writers: usize,
+    failed: bool,
+    cleanup: Vec<RecordingSinkCleanupGuard>,
 }
 
 /// Capacity of both the disk-write queue and the live broadcast ring. They must
@@ -61,7 +72,9 @@ impl RawRecordingWriter {
         db: DatabaseConnection,
         live: Option<LiveMap>,
         shutdown: WriterShutdown,
+        completion: Arc<Mutex<RecordingCompletion>>,
     ) -> Result<Self> {
+        completion.lock().await.open_writers += 1;
         let (sender, mut receiver) = mpsc::channel::<Bytes>(RECORDING_QUEUE_CAPACITY);
         let (drop_signal, mut drop_receiver) = mpsc::channel(1);
         let WriterShutdown { token, tracker } = shutdown;
@@ -117,11 +130,29 @@ impl RawRecordingWriter {
             // Complete the S3 object before the recording is marked ended, so a
             // reader that switches to S3 on `ended` always finds the object. On
             // failure the local scratch is kept (the recording is at least not lost).
+            let finalized = sink.finalize().await;
+            let mut completion = completion.lock().await;
+            completion.open_writers = completion.open_writers.saturating_sub(1);
+            match finalized {
+                Ok(guard) => completion.cleanup.push(guard),
+                Err(error) => {
+                    error!(%error, "Failed to write recording");
+                    completion.failed = true;
+                }
+            }
+            if completion.open_writers > 0 {
+                return;
+            }
+            let cleanup = std::mem::take(&mut completion.cleanup);
+            if completion.failed {
+                cleanup
+                    .into_iter()
+                    .for_each(RecordingSinkCleanupGuard::keep);
+                return;
+            }
 
             try_block!(async {
                 use sea_orm::ActiveValue::Set;
-
-                let cleanup_guard = sink.finalize().await?;
 
                 let id = model.id;
                 let db = &db;
@@ -133,7 +164,7 @@ impl RawRecordingWriter {
                 model.ended = Set(Some(OffsetDateTime::now_utc()));
                 model.update(db).await?;
 
-                drop(cleanup_guard);
+                drop(cleanup);
 
                 Ok::<(), anyhow::Error>(())
             } catch (error: anyhow::Error) {
