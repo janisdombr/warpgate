@@ -148,6 +148,36 @@ mod tests {
         );
     }
 
+    fn client_ip_from_forwarded_for(forwarded_for: &str) -> Option<String> {
+        let req = Request::builder()
+            .header(&X_FORWARDED_FOR, forwarded_for)
+            .finish();
+        trusted_client_ip(
+            &req,
+            &Secret::new("".into()),
+            Some("10.0.0.1".to_string()),
+            true,
+        )
+    }
+
+    // Client -> P1 -> P2 -> Warpgate: P2 appends P1, so the rightmost entry is
+    // the first proxy, never the client.
+    #[test]
+    fn two_proxy_forwarded_for_yields_the_first_proxy_not_the_client() {
+        assert_eq!(
+            client_ip_from_forwarded_for("198.51.100.7, 203.0.113.10"),
+            Some("203.0.113.10".to_string())
+        );
+    }
+
+    #[test]
+    fn one_proxy_forwarded_for_ignores_a_client_forged_leftmost_entry() {
+        assert_eq!(
+            client_ip_from_forwarded_for("192.0.2.66, 198.51.100.7"),
+            Some("198.51.100.7".to_string())
+        );
+    }
+
     #[test]
     fn trusted_client_ip_ignores_a_forwarded_for_that_is_not_an_address() {
         let req = Request::builder()
