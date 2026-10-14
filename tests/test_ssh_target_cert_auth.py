@@ -5,10 +5,14 @@ CA signs per connection, against a real dev-mode Vault.
 Refusals are asserted on the gateway's own log: a failed target connection in
 exec mode ends the session before the client reads the reason (#2548).
 """
+import contextlib
+import socket
 import subprocess
+import threading
 import time
 from uuid import uuid4
 
+import paramiko
 import pytest
 import requests
 
@@ -68,8 +72,12 @@ def ssh_port(processes: ProcessManager, ca_key: str) -> int:
 
 @pytest.fixture(scope="module")
 def backend(shared_wg: WarpgateProcess, vault: VaultInstance) -> str:
+    return add_backend(shared_wg, vault)
+
+
+def add_backend(wg: WarpgateProcess, vault: VaultInstance) -> str:
     name = f"vault-{uuid4()}"
-    with admin_client(f"https://localhost:{shared_wg.http_port}") as api:
+    with admin_client(f"https://localhost:{wg.http_port}") as api:
         api.create_secret_backend(
             sdk.SecretBackendRequest(
                 name=name,
@@ -306,3 +314,48 @@ class TestCertificateAuth:
                 return
             time.sleep(0.2)
         raise AssertionError(f"the refusal was not logged: {logged}")
+
+
+class _NoAnswer(paramiko.ServerInterface):
+    def get_allowed_auths(self, username):
+        return "publickey"
+
+    def check_auth_publickey(self, username, key):
+        # Blocks the transport thread, so the request is never answered.
+        time.sleep(600)
+        return paramiko.AUTH_FAILED
+
+
+@pytest.fixture
+def silent_target_port():
+    """Completes key exchange, then never answers authentication."""
+    sock = socket.create_server(("", 0), family=socket.AF_INET6, dualstack_ipv6=True)
+    host_key = paramiko.Ed25519Key.from_private_key_file("ssh-keys/id_ed25519")
+
+    def serve():
+        with contextlib.suppress(OSError):  # the socket closing ends the loop
+            while True:
+                transport = paramiko.Transport(sock.accept()[0])
+                transport.add_server_key(host_key)
+                transport.start_server(server=_NoAnswer())
+
+    threading.Thread(target=serve, daemon=True).start()
+    yield sock.getsockname()[1]
+    sock.close()
+
+
+def test_target_that_never_answers_authentication(
+    processes, vault, ca_key, wg_c_ed25519_pubkey, silent_target_port, timeout
+):
+    wg = processes.start_wg(config_patch={"ssh": {"target_handshake_timeout": "3s"}})
+    wait_port(wg.http_port, for_process=wg.process, recv=False)
+    wait_port(wg.ssh_port, for_process=wg.process)
+    user, target = setup_user_and_target(
+        processes,
+        wg,
+        wg_c_ed25519_pubkey,
+        ssh_port=silent_target_port,
+        auth=cert_auth(add_backend(wg, vault)),
+    )
+    logged = refusal(processes, wg, user, target, timeout)
+    assert "AuthenticationTimeout" in logged
